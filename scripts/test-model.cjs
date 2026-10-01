@@ -309,3 +309,15 @@ test("power readings read as watts", () => {
   assert.equal(model.wattsText(undefined), "");
   assert.equal(model.wattsText("n/a"), "");
 });
+
+test("bar label mode keeps inline and falls back to stacked letters", () => {
+  assert.equal(model.barLabelMode("text"), "text");
+  assert.equal(model.barLabelMode("inline"), "inline");
+  assert.equal(model.barLabelMode("INLINE"), "inline");
+  assert.equal(model.barLabelMode("icon"), "icon");
+  assert.equal(model.barLabelMode("Icons"), "text");
+  assert.equal(model.barLabelMode("nonsense"), "text");
+  assert.equal(model.barLabelMode(""), "text");
+  assert.equal(model.barLabelMode(undefined), "text");
+  assert.equal(model.barLabelMode(null), "text");
+});

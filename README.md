@@ -170,7 +170,7 @@ Setup → Plugins:
 | `cpuStyle` … `batteryStyle` | *(inherit)*                             | Per-module override of `style`                            |
 | `tabs`                    | `cpu,gpu,memory,disks,network,sensors,battery` | Tabs shown in the panel                              |
 | `graphWidth`              | `36`                                      | Width of each mini graph in the bar                       |
-| `barLabels`               | `text`                                    | `text` stacks the module's letters vertically (across a vertical bar), `icon` uses glyphs |
+| `barLabels`               | `text`                                    | `text` stacks the module's letters vertically (across a vertical bar), `inline` writes the short name horizontally on one line, `icon` uses glyphs |
 | `barDisks`                | *(follows `disksSource`)*                 | Disk readouts as `disk:show`, e.g. `all:speed,nvme-Samsung_SSD_970_EVO_Plus_1TB_S4EWNF0M921645X:both`; `show` is `speed`, `used` or `both`, `none` hides them |
 | `disksSource`             | `all`                                     | Disks page activity: `all` or a disk's by-id name         |
 | `barSensors`              | `cpu`                                     | Sensor readouts: `cpu`, `gpu`, or hwmon ids like `nct6687/fan1` or `nvme@0000:02:00.0/temp1` |
