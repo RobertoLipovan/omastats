@@ -29,7 +29,7 @@ mod util;
 
 use serde_json::{json, Value};
 use std::io::{BufReader, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 struct Control {
@@ -38,7 +38,14 @@ struct Control {
     focus: String,
     public_ip_requested: bool,
     stop: bool,
+    /// Set by a control line that should take effect before the next tick.
+    wake: bool,
 }
+
+/// Control state shared with the stdin listener, which wakes the sampling
+/// loop so a new interval or detail level applies at once instead of after
+/// the rest of the old interval.
+type Shared = Arc<(Mutex<Control>, Condvar)>;
 
 fn bounded_output_line(
     payload: &Value,
@@ -66,7 +73,8 @@ fn bounded_output_line(
     )
 }
 
-fn listen(control: Arc<Mutex<Control>>) {
+fn listen(shared: Shared) {
+    let (control, wake) = &*shared;
     let stdin = std::io::stdin();
     let mut input = BufReader::new(stdin.lock());
     while let Ok(Some(line)) = util::read_bounded_line(&mut input, util::CONTROL_LINE_LIMIT) {
@@ -94,8 +102,10 @@ fn listen(control: Arc<Mutex<Control>>) {
             }
             "pubip" => state.public_ip_requested = true,
             "quit" => state.stop = true,
-            _ => {}
+            _ => continue,
         }
+        state.wake = true;
+        wake.notify_one();
     }
     // stdin closing is not a stop signal: the shell keeps it open for control
     // lines, and a broken stdout is what ends the sampler.
@@ -128,17 +138,22 @@ fn main() {
         .and_then(|p| args.get(p + 1).cloned())
         .unwrap_or_default();
 
-    let control = Arc::new(Mutex::new(Control {
-        interval,
-        detail: detail_flag,
-        focus: focus_flag,
-        public_ip_requested: false,
-        stop: false,
-    }));
+    let shared: Shared = Arc::new((
+        Mutex::new(Control {
+            interval,
+            detail: detail_flag,
+            focus: focus_flag,
+            public_ip_requested: false,
+            stop: false,
+            wake: false,
+        }),
+        Condvar::new(),
+    ));
     if !once {
-        let shared = Arc::clone(&control);
-        std::thread::spawn(move || listen(shared));
+        let listener = Arc::clone(&shared);
+        std::thread::spawn(move || listen(listener));
     }
+    let (control, woken) = &*shared;
 
     let mut cpu = cpu::CpuSampler::new();
     let mut gpu = gpu::GpuSampler::new();
@@ -259,9 +274,12 @@ fn main() {
             break;
         }
         let spent = tick_start.elapsed().as_secs_f64();
-        std::thread::sleep(Duration::from_secs_f64(
-            (current_interval - spent).max(0.02),
-        ));
+        let pause = Duration::from_secs_f64((current_interval - spent).max(0.02));
+        let Ok(state) = control.lock() else { break };
+        let Ok((mut state, _)) = woken.wait_timeout_while(state, pause, |s| !s.wake) else {
+            break;
+        };
+        state.wake = false;
     }
 
     gpu.stop();

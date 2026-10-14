@@ -1639,6 +1639,9 @@ class Controller:
         self.lock = threading.Lock()
         self.public_ip_requested = False
         self.stop = False
+        # Wakes the sampling loop so a new interval or detail level applies at
+        # once instead of after the rest of the old interval.
+        self.wake = threading.Event()
 
     def listen(self) -> None:
         for line in bounded_lines(sys.stdin.buffer, CONTROL_LINE_LIMIT):
@@ -1659,7 +1662,11 @@ class Controller:
                     self.public_ip_requested = True
                 elif parts[0] == "quit":
                     self.stop = True
-                    return
+                else:
+                    continue
+            self.wake.set()
+            if self.stop:
+                return
 
 
 def main() -> int:
@@ -1790,7 +1797,8 @@ def main() -> int:
         if once:
             break
         spent = time.monotonic() - now_mono
-        time.sleep(max(0.02, current_interval - spent))
+        controller.wake.wait(max(0.02, current_interval - spent))
+        controller.wake.clear()
 
     gpu.stop()
     return 0
