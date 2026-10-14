@@ -1,3 +1,4 @@
+use crate::gpu::NvidiaProcess;
 use crate::util::{bounded_text, rate, read_text, round1, run, EXTERNAL_TEXT_LIMIT};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -39,6 +40,130 @@ pub struct ProcessSampler {
     names: HashMap<u32, String>,
     sockets_prev: HashMap<String, (u64, u64)>,
     sockets_time: Option<Instant>,
+    /// Busy counters of each DRM client, by (card, client id) and engine.
+    gpu_prev: HashMap<(String, String), HashMap<String, EngineCounter>>,
+    gpu_time: Option<Instant>,
+}
+
+/// An engine's busy counter. Most drivers count busy nanoseconds; xe counts
+/// busy cycles against a total cycle counter instead.
+#[derive(Clone, Copy, Default)]
+struct EngineCounter {
+    busy: u64,
+    total: Option<u64>,
+    capacity: u64,
+}
+
+/// One DRM client read from fdinfo.
+#[derive(Default)]
+struct DrmClient {
+    pdev: String,
+    id: String,
+    engines: HashMap<String, EngineCounter>,
+    /// Resident bytes by memory region (vram, gtt, local0, system0, ...).
+    regions: HashMap<String, u64>,
+}
+
+/// "12 KiB", "2 MiB" or a bare byte count.
+fn fdinfo_size(raw: &str) -> Option<u64> {
+    let mut parts = raw.split_whitespace();
+    let value: u64 = parts.next()?.parse().ok()?;
+    let scale = match parts.next() {
+        None => 1,
+        Some("KiB") => 1 << 10,
+        Some("MiB") => 1 << 20,
+        Some("GiB") => 1 << 30,
+        Some(_) => return None,
+    };
+    Some(value.saturating_mul(scale))
+}
+
+/// The DRM usage stats a driver writes into /proc/<pid>/fdinfo/<fd>, as
+/// documented in the kernel's drm-usage-stats.
+fn parse_drm_fdinfo(text: &str) -> Option<DrmClient> {
+    let mut client = DrmClient::default();
+    let mut legacy: HashMap<String, u64> = HashMap::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if key == "drm-pdev" {
+            client.pdev = value.to_string();
+        } else if key == "drm-client-id" {
+            client.id = value.to_string();
+        } else if let Some(engine) = key.strip_prefix("drm-engine-capacity-") {
+            let capacity = value.parse().unwrap_or(1).max(1);
+            client.engines.entry(engine.to_string()).or_default().capacity = capacity;
+        } else if let Some(engine) = key.strip_prefix("drm-engine-") {
+            let busy = value.trim_end_matches("ns").trim().parse().unwrap_or(0);
+            client.engines.entry(engine.to_string()).or_default().busy = busy;
+        } else if let Some(engine) = key.strip_prefix("drm-total-cycles-") {
+            let total = value.parse().ok();
+            client.engines.entry(engine.to_string()).or_default().total = total;
+        } else if let Some(engine) = key.strip_prefix("drm-cycles-") {
+            let busy = value.parse().unwrap_or(0);
+            client.engines.entry(engine.to_string()).or_default().busy = busy;
+        } else if let Some(region) = key.strip_prefix("drm-resident-") {
+            if let Some(bytes) = fdinfo_size(value) {
+                client.regions.insert(region.to_string(), bytes);
+            }
+        } else if let Some(region) = key.strip_prefix("drm-memory-") {
+            if let Some(bytes) = fdinfo_size(value) {
+                legacy.insert(region.to_string(), bytes);
+            }
+        }
+    }
+    if client.pdev.is_empty() || client.id.is_empty() {
+        return None;
+    }
+    if client.regions.is_empty() {
+        client.regions = legacy;
+    }
+    Some(client)
+}
+
+/// The graphics memory a client holds: its dedicated video memory, plus the
+/// system memory it maps when the card has no memory of its own.
+fn client_memory(client: &DrmClient, integrated: bool) -> u64 {
+    client
+        .regions
+        .iter()
+        .filter(|(region, _)| {
+            region.starts_with("vram")
+                || region.starts_with("local")
+                || (integrated
+                    && (region.starts_with("gtt")
+                        || region.starts_with("system")
+                        || region.starts_with("stolen")))
+        })
+        .map(|(_, bytes)| *bytes)
+        .sum()
+}
+
+/// How busy a client kept its busiest engine, in percent.
+fn client_busy(
+    now: &HashMap<String, EngineCounter>,
+    before: Option<&HashMap<String, EngineCounter>>,
+    elapsed: f64,
+) -> f64 {
+    let Some(before) = before else { return 0.0 };
+    let mut busiest: f64 = 0.0;
+    for (engine, counter) in now {
+        let Some(prev) = before.get(engine) else {
+            continue;
+        };
+        let busy = counter.busy.saturating_sub(prev.busy) as f64;
+        let share = match (counter.total, prev.total) {
+            (Some(total), Some(prev_total)) if total > prev_total => {
+                busy / (total - prev_total) as f64
+            }
+            (None, None) if elapsed > 0.0 => busy / (elapsed * 1e9),
+            _ => 0.0,
+        };
+        busiest = busiest.max(share / counter.capacity.max(1) as f64 * 100.0);
+    }
+    busiest.min(100.0)
 }
 
 /// A readable name for a process: the kernel's 15-character comm, or the
@@ -74,12 +199,165 @@ impl ProcessSampler {
             names: HashMap::new(),
             sockets_prev: HashMap::new(),
             sockets_time: None,
+            gpu_prev: HashMap::new(),
+            gpu_time: None,
         }
     }
 
     pub fn reset(&mut self) {
         self.prev.clear();
         self.names.clear();
+    }
+
+    pub fn reset_gpu(&mut self) {
+        self.gpu_prev.clear();
+        self.gpu_time = None;
+    }
+
+    fn process_name(&self, pid: u32) -> String {
+        if let Some(name) = self.names.get(&pid) {
+            return name.clone();
+        }
+        let stat = read_text(format!("/proc/{pid}/stat")).unwrap_or_default();
+        match (stat.find('('), stat.rfind(')')) {
+            (Some(o), Some(c)) if c > o => display_name(pid, &stat[o + 1..c]),
+            _ => format!("pid {pid}"),
+        }
+    }
+
+    /// What each process uses of every GPU, by the card's PCI address. DRM
+    /// drivers (amdgpu, i915, xe, nouveau and others) publish each client's
+    /// engine time and memory in /proc/<pid>/fdinfo, readable for the user's
+    /// own processes; NVIDIA's rows come from nvidia-smi instead. A client
+    /// shared between processes counts once, for the first one found.
+    pub fn gpu_usage(
+        &mut self,
+        integrated: &[String],
+        nvidia: Vec<NvidiaProcess>,
+    ) -> HashMap<String, Vec<Value>> {
+        let now = Instant::now();
+        let elapsed = self
+            .gpu_time
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(0.0);
+        // Client ids are recycled, so a long gap starts over.
+        let usable = elapsed > 0.0 && elapsed < 5.0;
+
+        // (card, pid) -> (load, memory)
+        let mut usage: HashMap<(String, u32), (f64, u64)> = HashMap::new();
+        let mut counters: HashMap<(String, String), HashMap<String, EngineCounter>> =
+            HashMap::new();
+        if let Ok(entries) = fs::read_dir("/proc") {
+            let mut scanned = 0usize;
+            for entry in entries.filter_map(Result::ok) {
+                let pid: u32 = match entry.file_name().to_string_lossy().parse() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                scanned += 1;
+                if scanned > PROCESS_SCAN_LIMIT {
+                    break;
+                }
+                let fds = match fs::read_dir(format!("/proc/{pid}/fd")) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                for fd in fds.filter_map(Result::ok).take(FD_SCAN_LIMIT) {
+                    let is_drm = fs::read_link(fd.path())
+                        .is_ok_and(|t| t.to_string_lossy().starts_with("/dev/dri/"));
+                    if !is_drm {
+                        continue;
+                    }
+                    let path = format!("/proc/{pid}/fdinfo/{}", fd.file_name().to_string_lossy());
+                    let Some(text) = self.read_small(&path) else {
+                        continue;
+                    };
+                    let Some(client) = parse_drm_fdinfo(&String::from_utf8_lossy(text)) else {
+                        continue;
+                    };
+                    let key = (client.pdev.clone(), client.id.clone());
+                    if counters.contains_key(&key) {
+                        continue;
+                    }
+                    let busy = if usable {
+                        client_busy(&client.engines, self.gpu_prev.get(&key), elapsed)
+                    } else {
+                        0.0
+                    };
+                    let memory = client_memory(&client, integrated.contains(&client.pdev));
+                    let total = usage.entry((client.pdev.clone(), pid)).or_default();
+                    total.0 += busy;
+                    total.1 += memory;
+                    counters.insert(key, client.engines);
+                }
+            }
+        }
+        self.gpu_prev = counters;
+        self.gpu_time = Some(now);
+
+        struct Usage {
+            name: String,
+            pid: u32,
+            count: u32,
+            util: f64,
+            mem: f64,
+        }
+        let mut groups: HashMap<String, HashMap<String, Usage>> = HashMap::new();
+        let mut add = |slot: String, pid: u32, name: String, util: f64, mem: f64| {
+            let group = groups
+                .entry(slot)
+                .or_default()
+                .entry(name.clone())
+                .or_insert(Usage {
+                    name,
+                    pid,
+                    count: 0,
+                    util: 0.0,
+                    mem: 0.0,
+                });
+            group.count += 1;
+            group.util = (group.util + util).min(100.0);
+            group.mem += mem;
+        };
+        for ((slot, pid), (util, mem)) in usage {
+            add(slot, pid, self.process_name(pid), util, mem as f64);
+        }
+        for row in nvidia {
+            let name = if fs::metadata(format!("/proc/{}", row.pid)).is_ok() {
+                self.process_name(row.pid)
+            } else {
+                row.name
+            };
+            add(row.slot, row.pid, name, row.util, row.mem);
+        }
+
+        groups
+            .into_iter()
+            .map(|(slot, by_name)| {
+                let mut list: Vec<Usage> = by_name
+                    .into_values()
+                    .filter(|g| g.util > 0.0 || g.mem > 0.0)
+                    .collect();
+                list.sort_by(|a, b| {
+                    b.util
+                        .partial_cmp(&a.util)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(b.mem.partial_cmp(&a.mem).unwrap_or(std::cmp::Ordering::Equal))
+                        .then(a.name.cmp(&b.name))
+                });
+                let rows = list
+                    .iter()
+                    .take(PROC_LIMIT)
+                    .map(|g| {
+                        json!({
+                            "name": g.name, "pid": g.pid, "count": g.count,
+                            "util": round1(g.util), "mem": g.mem,
+                        })
+                    })
+                    .collect();
+                (slot, rows)
+            })
+            .collect()
     }
 
     fn read_small(&mut self, path: &str) -> Option<&[u8]> {
@@ -472,5 +750,80 @@ fn cgroup_label(cgroup: &str) -> String {
         "other".to_string()
     } else {
         bounded_text(stem, EXTERNAL_TEXT_LIMIT)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AMDGPU: &str = "pos:\t0\nflags:\t02100002\ndrm-driver:\tamdgpu\ndrm-client-id:\t20516\n\
+drm-pdev:\t0000:11:00.0\ndrm-total-vram:\t12 KiB\ndrm-resident-vram:\t12 KiB\n\
+drm-resident-gtt:\t2 MiB\ndrm-resident-cpu:\t0\ndrm-memory-vram:\t12 KiB\n\
+drm-engine-gfx:\t6438199656611 ns\ndrm-engine-compute:\t99404265 ns\n";
+
+    #[test]
+    fn amdgpu_fdinfo_gives_engines_and_regions() {
+        let client = parse_drm_fdinfo(AMDGPU).expect("a DRM client");
+        assert_eq!(client.pdev, "0000:11:00.0");
+        assert_eq!(client.id, "20516");
+        assert_eq!(client.engines["gfx"].busy, 6_438_199_656_611);
+        assert_eq!(client.regions["vram"], 12 * 1024);
+        assert_eq!(client_memory(&client, false), 12 * 1024);
+        assert_eq!(client_memory(&client, true), 12 * 1024 + 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_file_without_a_client_is_not_a_drm_client() {
+        assert!(parse_drm_fdinfo("pos:\t0\nflags:\t02\n").is_none());
+        assert!(parse_drm_fdinfo("drm-driver:\tamdgpu\ndrm-pdev:\t0000:11:00.0\n").is_none());
+    }
+
+    #[test]
+    fn busy_time_becomes_the_busiest_engines_share() {
+        let counter = |busy| EngineCounter { busy, total: None, capacity: 1 };
+        let before = HashMap::from([
+            ("gfx".to_string(), counter(1_000_000_000)),
+            ("compute".to_string(), counter(0)),
+        ]);
+        let now = HashMap::from([
+            ("gfx".to_string(), counter(1_250_000_000)),
+            ("compute".to_string(), counter(100_000_000)),
+        ]);
+        assert_eq!(client_busy(&now, Some(&before), 1.0), 25.0);
+        assert_eq!(client_busy(&now, None, 1.0), 0.0);
+    }
+
+    #[test]
+    fn xe_cycles_are_measured_against_total_cycles() {
+        let text = "drm-client-id:\t3\ndrm-pdev:\t0000:00:02.0\n\
+drm-cycles-rcs:\t500\ndrm-total-cycles-rcs:\t1000\ndrm-engine-capacity-rcs:\t1\n";
+        let before = parse_drm_fdinfo(text).unwrap().engines;
+        let later = "drm-client-id:\t3\ndrm-pdev:\t0000:00:02.0\n\
+drm-cycles-rcs:\t800\ndrm-total-cycles-rcs:\t2000\n";
+        let now = parse_drm_fdinfo(later).unwrap().engines;
+        assert_eq!(client_busy(&now, Some(&before), 1.0), 30.0);
+    }
+
+    #[test]
+    fn engine_capacity_divides_the_share() {
+        let before = HashMap::from([(
+            "vcn".to_string(),
+            EngineCounter { busy: 0, total: None, capacity: 2 },
+        )]);
+        let now = HashMap::from([(
+            "vcn".to_string(),
+            EngineCounter { busy: 1_000_000_000, total: None, capacity: 2 },
+        )]);
+        assert_eq!(client_busy(&now, Some(&before), 1.0), 50.0);
+    }
+
+    #[test]
+    fn fdinfo_sizes_carry_their_unit() {
+        assert_eq!(fdinfo_size("0"), Some(0));
+        assert_eq!(fdinfo_size("12 KiB"), Some(12 * 1024));
+        assert_eq!(fdinfo_size("3 MiB"), Some(3 << 20));
+        assert_eq!(fdinfo_size("1 GiB"), Some(1 << 30));
+        assert_eq!(fdinfo_size("lots"), None);
     }
 }

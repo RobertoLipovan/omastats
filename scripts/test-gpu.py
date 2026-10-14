@@ -93,6 +93,63 @@ class RuntimePmTests(unittest.TestCase):
             self.assertEqual(gate.read(str(device), busy, 101.0), "80")
 
 
+AMDGPU_FDINFO = """pos:\t0
+drm-driver:\tamdgpu
+drm-client-id:\t20516
+drm-pdev:\t0000:11:00.0
+drm-resident-vram:\t12 KiB
+drm-resident-gtt:\t2 MiB
+drm-resident-cpu:\t0
+drm-memory-vram:\t12 KiB
+drm-engine-gfx:\t6438199656611 ns
+drm-engine-compute:\t99404265 ns
+"""
+
+PMON = """# gpu         pid   type     sm    mem    enc    dec    jpg    ofa     fb   ccpm    command
+# Idx           #    C/G      %      %      %      %      %      %     MB     MB    name
+    0      37129     C      -      -      -      -      -      -   6196      0    llama-server
+    0    1904057     G     30      1      -      -      -      -      6      0    Hyprland
+    1        812     G      4      0      -      -      -      -     12      0    other-card
+"""
+
+
+class GpuProcessTests(unittest.TestCase):
+    def test_amdgpu_fdinfo_gives_engines_and_regions(self):
+        client = NAMESPACE["parse_drm_fdinfo"](AMDGPU_FDINFO)
+        self.assertEqual((client["pdev"], client["id"]), ("0000:11:00.0", "20516"))
+        self.assertEqual(client["engines"]["gfx"]["busy"], 6438199656611)
+        memory = NAMESPACE["client_memory"]
+        self.assertEqual(memory(client, False), 12 * 1024)
+        self.assertEqual(memory(client, True), 12 * 1024 + 2 * 1024 * 1024)
+
+    def test_a_file_without_a_client_is_not_a_drm_client(self):
+        self.assertIsNone(NAMESPACE["parse_drm_fdinfo"]("pos:\t0\nflags:\t02\n"))
+
+    def test_busy_time_becomes_the_busiest_engines_share(self):
+        def counter(busy, capacity=1):
+            return {"busy": busy, "total": None, "capacity": capacity}
+        busy = NAMESPACE["client_busy"]
+        before = {"gfx": counter(1_000_000_000), "compute": counter(0)}
+        now = {"gfx": counter(1_250_000_000), "compute": counter(100_000_000)}
+        self.assertEqual(busy(now, before, 1.0), 25.0)
+        self.assertEqual(busy(now, None, 1.0), 0.0)
+        self.assertEqual(busy({"vcn": counter(10**9, 2)}, {"vcn": counter(0, 2)}, 1.0), 50.0)
+
+    def test_xe_cycles_are_measured_against_total_cycles(self):
+        parse = NAMESPACE["parse_drm_fdinfo"]
+        head = "drm-client-id:\t3\ndrm-pdev:\t0000:00:02.0\n"
+        before = parse(head + "drm-cycles-rcs:\t500\ndrm-total-cycles-rcs:\t1000\n")["engines"]
+        now = parse(head + "drm-cycles-rcs:\t800\ndrm-total-cycles-rcs:\t2000\n")["engines"]
+        self.assertEqual(NAMESPACE["client_busy"](now, before, 1.0), 30.0)
+
+    def test_pmon_rows_follow_the_header_and_card_index(self):
+        rows = NAMESPACE["parse_pmon"](PMON, {"0": "0000:01:00.0"})
+        self.assertEqual([r["pid"] for r in rows], [37129, 1904057])
+        self.assertEqual(rows[0]["util"], 0.0)
+        self.assertEqual(rows[0]["mem"], 6196 * 1024 * 1024)
+        self.assertEqual((rows[1]["name"], rows[1]["util"]), ("Hyprland", 30.0))
+
+
 class CpuPowerTests(unittest.TestCase):
     def test_ppt_in_milliwatts_is_recognised(self):
         watts = NAMESPACE["ppt_watts"]
@@ -105,7 +162,6 @@ class CpuPowerTests(unittest.TestCase):
         self.assertEqual(delta(1_500, 1_000, 10_000), 500)
         self.assertEqual(delta(200, 9_800, 10_000), 400)
         self.assertEqual(delta(200, 9_800, 0), 0)
-
 
 
 if __name__ == "__main__":

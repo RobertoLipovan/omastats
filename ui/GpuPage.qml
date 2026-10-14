@@ -111,6 +111,21 @@ Column {
         foreground: root.foreground
         fontFamily: root.fontFamily
       }
+
+      // What each process uses of this card. The list only arrives while
+      // the GPU page is open, so until then it is still being measured.
+      ProcessList {
+        visible: Model.flag(root.settings, "showProcesses")
+        expandable: false
+        items: gpuCard.gpu && Array.isArray(gpuCard.gpu.procs) ? gpuCard.gpu.procs : []
+        columns: [
+          { key: "util", kind: "percent", title: "Load" },
+          { key: "mem", kind: "bytes", title: gpuCard.gpu && gpuCard.gpu.integrated ? "Memory" : "VRAM" }
+        ]
+        emptyText: gpuCard.gpu && Array.isArray(gpuCard.gpu.procs) ? "Nothing using this GPU" : "Measuring…"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+      }
     }
   }
 

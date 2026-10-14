@@ -666,6 +666,8 @@ class GpuSampler:
         self.latest: dict[str, dict] = {}
         self.lock = threading.Lock()
         self.proc: subprocess.Popen | None = None
+        # nvidia-smi's card index to PCI address, looked up on first use.
+        self.nvidia_slots: dict[str, str] | None = None
         self._detect()
 
     def _detect(self) -> None:
@@ -805,6 +807,22 @@ class GpuSampler:
 
     def sample_all(self) -> list[dict]:
         return [self._sample_card(entry) for entry in self.cards]
+
+    def integrated_slots(self) -> set[str]:
+        return {entry.slot for entry in self.cards if entry.integrated}
+
+    def nvidia_processes(self) -> list[dict]:
+        """What each process uses of every NVIDIA card. The proprietary driver
+        publishes no per-client counters in fdinfo, so this asks nvidia-smi."""
+        if self.proc is None:
+            return []
+        if self.nvidia_slots is None:
+            self.nvidia_slots = {}
+            for line in run(["nvidia-smi", "--query-gpu=index,pci.bus_id", "--format=csv,noheader"]).splitlines():
+                index, _, bus = line.partition(",")
+                if bus:
+                    self.nvidia_slots[index.strip()] = normalize_slot(bus)
+        return parse_pmon(run(["nvidia-smi", "pmon", "-c", "1", "-s", "um"]), self.nvidia_slots)
 
     def sample(self) -> dict | None:
         readings = self.sample_all()
@@ -1604,10 +1622,88 @@ class ProcessSampler:
         self.names: dict[int, str] = {}
         self.sockets_prev: dict[str, tuple[int, int]] = {}
         self.sockets_time: float | None = None
+        # Busy counters of each DRM client, by (card, client id) and engine.
+        self.gpu_prev: dict[tuple[str, str], dict[str, dict]] = {}
+        self.gpu_time: float | None = None
 
     def reset(self) -> None:
         self.prev = {}
         self.names = {}
+
+    def reset_gpu(self) -> None:
+        self.gpu_prev = {}
+        self.gpu_time = None
+
+    def process_name(self, pid: int) -> str:
+        name = self.names.get(pid)
+        if name is not None:
+            return name
+        stat = read_text(f"/proc/{pid}/stat")
+        open_paren, close = stat.find("("), stat.rfind(")")
+        return display_name(pid, stat[open_paren + 1:close]) if 0 <= open_paren < close else f"pid {pid}"
+
+    def gpu_usage(self, integrated: set[str], nvidia: list[dict]) -> dict[str, list[dict]]:
+        """What each process uses of every GPU, by the card's PCI address. DRM
+        drivers (amdgpu, i915, xe, nouveau and others) publish each client's
+        engine time and memory in /proc/<pid>/fdinfo, readable for the user's
+        own processes; NVIDIA's rows come from nvidia-smi instead. A client
+        shared between processes counts once, for the first one found."""
+        now = time.monotonic()
+        elapsed = now - self.gpu_time if self.gpu_time is not None else 0.0
+        # Client ids are recycled, so a long gap starts over.
+        usable = 0.0 < elapsed < 5.0
+        usage: dict[tuple[str, int], list[float]] = {}
+        counters: dict[tuple[str, str], dict[str, dict]] = {}
+        for entry in list_dir("/proc", PROCESS_SCAN_LIMIT):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            for fd in list_dir(f"/proc/{pid}/fd", FD_SCAN_LIMIT):
+                try:
+                    if not os.readlink(f"/proc/{pid}/fd/{fd}").startswith("/dev/dri/"):
+                        continue
+                except OSError:
+                    continue
+                client = parse_drm_fdinfo(read_text(f"/proc/{pid}/fdinfo/{fd}"))
+                if client is None:
+                    continue
+                key = (client["pdev"], client["id"])
+                if key in counters:
+                    continue
+                busy = client_busy(client["engines"], self.gpu_prev.get(key), elapsed) if usable else 0.0
+                total = usage.setdefault((client["pdev"], pid), [0.0, 0.0])
+                total[0] += busy
+                total[1] += client_memory(client, client["pdev"] in integrated)
+                counters[key] = client["engines"]
+        self.gpu_prev = counters
+        self.gpu_time = now
+
+        groups: dict[str, dict[str, dict]] = {}
+
+        def add(slot: str, pid: int, name: str, util: float, mem: float) -> None:
+            group = groups.setdefault(slot, {}).setdefault(
+                name, {"name": name, "pid": pid, "count": 0, "util": 0.0, "mem": 0.0})
+            group["count"] += 1
+            group["util"] = min(100.0, group["util"] + util)
+            group["mem"] += mem
+
+        for (slot, pid), (util, mem) in usage.items():
+            add(slot, pid, self.process_name(pid), util, mem)
+        for row in nvidia:
+            name = self.process_name(row["pid"]) if os.path.exists(f"/proc/{row['pid']}") else row["name"]
+            add(row["slot"], row["pid"], name, row["util"] or 0.0, row["mem"])
+
+        result: dict[str, list[dict]] = {}
+        for slot, by_name in groups.items():
+            ranked = sorted(
+                (g for g in by_name.values() if g["util"] > 0 or g["mem"] > 0),
+                key=lambda g: (-g["util"], -g["mem"], g["name"]),
+            )
+            result[slot] = [
+                {"name": g["name"], "pid": g["pid"], "count": g["count"], "util": round(g["util"], 1), "mem": g["mem"]}
+                for g in ranked[:PROC_LIMIT]
+            ]
+        return result
 
     def sample(self, elapsed: float, full: bool = False) -> dict:
         current: dict[int, tuple[int, int, int, int]] = {}
@@ -1805,6 +1901,88 @@ class ProcessSampler:
         ]
 
 
+def fdinfo_size(raw: str) -> int | None:
+    """ "12 KiB", "2 MiB" or a bare byte count."""
+    parts = raw.split()
+    if not parts or not parts[0].isdigit():
+        return None
+    scale = {None: 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}.get(parts[1] if len(parts) > 1 else None)
+    return int(parts[0]) * scale if scale else None
+
+
+def parse_drm_fdinfo(text: str) -> dict | None:
+    """The DRM usage stats a driver writes into /proc/<pid>/fdinfo/<fd>, as
+    documented in the kernel's drm-usage-stats. Most drivers count busy
+    nanoseconds per engine; xe counts busy cycles against total cycles."""
+    client: dict = {"pdev": "", "id": "", "engines": {}, "regions": {}}
+    legacy: dict[str, int] = {}
+
+    def engine(name: str) -> dict:
+        return client["engines"].setdefault(name, {"busy": 0, "total": None, "capacity": 1})
+
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        value = value.strip()
+        if key == "drm-pdev":
+            client["pdev"] = value
+        elif key == "drm-client-id":
+            client["id"] = value
+        elif key.startswith("drm-engine-capacity-"):
+            engine(key[20:])["capacity"] = max(1, parse_int(value, 1) or 1)
+        elif key.startswith("drm-engine-"):
+            engine(key[11:])["busy"] = parse_int(value.removesuffix("ns").strip(), 0) or 0
+        elif key.startswith("drm-total-cycles-"):
+            engine(key[17:])["total"] = parse_int(value)
+        elif key.startswith("drm-cycles-"):
+            engine(key[11:])["busy"] = parse_int(value, 0) or 0
+        elif key.startswith("drm-resident-"):
+            size = fdinfo_size(value)
+            if size is not None:
+                client["regions"][key[13:]] = size
+        elif key.startswith("drm-memory-"):
+            size = fdinfo_size(value)
+            if size is not None:
+                legacy[key[11:]] = size
+    if not client["pdev"] or not client["id"]:
+        return None
+    if not client["regions"]:
+        client["regions"] = legacy
+    return client
+
+
+def client_memory(client: dict, integrated: bool) -> int:
+    """The graphics memory a client holds: its dedicated video memory, plus
+    the system memory it maps when the card has no memory of its own."""
+    shared = ("gtt", "system", "stolen") if integrated else ()
+    return sum(
+        size for region, size in client["regions"].items()
+        if region.startswith(("vram", "local") + shared)
+    )
+
+
+def client_busy(now: dict[str, dict], before: dict[str, dict] | None, elapsed: float) -> float:
+    """How busy a client kept its busiest engine, in percent."""
+    if before is None:
+        return 0.0
+    busiest = 0.0
+    for name, counter in now.items():
+        prev = before.get(name)
+        if prev is None:
+            continue
+        busy = max(0, counter["busy"] - prev["busy"])
+        if counter["total"] is not None and prev["total"] is not None:
+            span = counter["total"] - prev["total"]
+            share = busy / span if span > 0 else 0.0
+        elif counter["total"] is None and prev["total"] is None and elapsed > 0:
+            share = busy / (elapsed * 1e9)
+        else:
+            share = 0.0
+        busiest = max(busiest, share / max(1, counter["capacity"]) * 100)
+    return min(100.0, busiest)
+
+
 def cgroup_label(cgroup: str) -> str:
     """Label for a socket whose owner we cannot inspect, from its cgroup."""
     last = cgroup.rsplit("/", 1)[-1].replace("\\x2d", "-")
@@ -1915,7 +2093,9 @@ def main() -> int:
     battery_cache: dict | None = None
     procs_cache: dict | None = None
     connections_cache: list | None = None
+    gpu_procs_cache: dict | None = None
     network_primed = False
+    gpu_primed = False
 
     while not controller.stop:
         with controller.lock:
@@ -1925,18 +2105,22 @@ def main() -> int:
             controller.public_ip_requested = False
             current_interval = controller.interval
         want_network = bool(detail) and focus == "network"
+        want_gpu = bool(detail) and focus == "gpu"
         cold_procs = bool(detail) and last_procs is None
         cold_network = want_network and not network_primed
+        cold_gpu = want_gpu and not gpu_primed
         # Per-process figures are differences between two readings. When the
         # panel opens, the first reading is taken and the second follows after
         # WARM_UP, so the lists show real figures at once instead of zeros.
-        if cold_procs or cold_network:
+        if cold_procs or cold_network or cold_gpu:
             try:
                 if cold_procs:
                     procs.sample(1.0, False)
                     last_procs = time.monotonic()
                 if cold_network:
                     procs.network_usage(False)
+                if cold_gpu:
+                    procs.gpu_usage(gpu.integrated_slots(), [])
             except Exception:  # noqa: BLE001 - the real reading reports errors
                 pass
             time.sleep(WARM_UP)
@@ -1950,7 +2134,7 @@ def main() -> int:
         payload: dict = {"seq": seq, "t": now, "elapsed": round(elapsed, 3), "interval": current_interval, "errors": []}
         # A freshly opened panel or page reads at once rather than waiting for
         # the next once-a-second pass.
-        slow_due = cold_procs or cold_network or last_slow is None or now_mono - last_slow >= 0.95
+        slow_due = cold_procs or cold_network or cold_gpu or last_slow is None or now_mono - last_slow >= 0.95
         if slow_due:
             try:
                 sensors_cache = sensors.sample(now)
@@ -1981,6 +2165,18 @@ def main() -> int:
                     connections_cache = procs.network_usage(detail >= 2)
                 except Exception as error:  # noqa: BLE001
                     payload["errors"].append(f"connections: {error}")
+            if want_gpu:
+                gpu_primed = True
+                try:
+                    gpu_procs_cache = procs.gpu_usage(gpu.integrated_slots(), gpu.nvidia_processes())
+                except Exception as error:  # noqa: BLE001
+                    gpu_procs_cache = None
+                    payload["errors"].append(f"gpu processes: {error}")
+            else:
+                if gpu_primed:
+                    procs.reset_gpu()
+                gpu_primed = False
+                gpu_procs_cache = None
             last_slow = now_mono
         for key, fn in (
             ("cpu", cpu.sample),
@@ -1997,6 +2193,9 @@ def main() -> int:
         # "gpu" stays the primary card so older consumers keep working; the
         # full list travels alongside it.
         listed = payload.get("gpus")
+        if isinstance(listed, list) and gpu_procs_cache is not None:
+            for card in listed:
+                card["procs"] = gpu_procs_cache.get(card.get("id"), [])
         payload["gpu"] = listed[0] if isinstance(listed, list) and listed else None
         if isinstance(payload.get("net"), dict):
             payload["net"]["procs"] = connections_cache

@@ -7,7 +7,8 @@
 //!
 //! Control lines on stdin:
 //!     detail 0|1|2    0 = none, 1 = top processes, 2 = every process
-//!     focus <page>    page the panel shows; "network" adds per-process traffic
+//!     focus <page>    page the panel shows; "network" adds per-process
+//!                     traffic and "gpu" what each process uses of every card
 //!     interval <sec>  change the sampling interval (0.1 – 30)
 //!     pubip           refresh the public IP address in the background
 //!     quit            exit
@@ -194,7 +195,9 @@ fn main() {
     let mut battery_cache = Value::Null;
     let mut procs_cache = Value::Null;
     let mut connections_cache = Value::Null;
+    let mut gpu_procs_cache: Option<std::collections::HashMap<String, Vec<Value>>> = None;
     let mut network_primed = false;
+    let mut gpu_primed = false;
 
     loop {
         let (detail, focus, want_public, current_interval, stop) = {
@@ -216,15 +219,20 @@ fn main() {
             break;
         }
         let want_network = detail > 0 && focus == "network";
+        let want_gpu = detail > 0 && focus == "gpu";
         let cold_procs = detail > 0 && last_procs.is_none();
         let cold_network = want_network && !network_primed;
-        if cold_procs || cold_network {
+        let cold_gpu = want_gpu && !gpu_primed;
+        if cold_procs || cold_network || cold_gpu {
             if cold_procs {
                 let _ = procs.sample(1.0, false);
                 last_procs = Some(Instant::now());
             }
             if cold_network {
                 let _ = procs.network_usage(false);
+            }
+            if cold_gpu {
+                let _ = procs.gpu_usage(&gpu.integrated_slots(), Vec::new());
             }
             std::thread::sleep(WARM_UP);
         }
@@ -240,6 +248,7 @@ fn main() {
         // for the next once-a-second pass.
         let slow_due = cold_procs
             || cold_network
+            || cold_gpu
             || last_slow.is_none_or(|t| tick_start.duration_since(t).as_secs_f64() >= 0.95);
         if slow_due {
             sensors_cache = sensors.sample(now);
@@ -263,6 +272,17 @@ fn main() {
                 network_primed = false;
                 Value::Null
             };
+            gpu_procs_cache = if want_gpu {
+                gpu_primed = true;
+                let nvidia = gpu.nvidia_processes();
+                Some(procs.gpu_usage(&gpu.integrated_slots(), nvidia))
+            } else {
+                if gpu_primed {
+                    procs.reset_gpu();
+                }
+                gpu_primed = false;
+                None
+            };
             last_slow = Some(tick_start);
         }
 
@@ -276,7 +296,13 @@ fn main() {
         payload["cpu"] = cpu.sample();
         // "gpu" stays the primary card so older consumers keep working; the
         // full list travels alongside it.
-        let gpus = gpu.sample_all();
+        let mut gpus = gpu.sample_all();
+        if let Some(lists) = &gpu_procs_cache {
+            for card in &mut gpus {
+                let id = card["id"].as_str().unwrap_or("").to_string();
+                card["procs"] = Value::Array(lists.get(&id).cloned().unwrap_or_default());
+            }
+        }
         payload["gpu"] = gpus.first().cloned().unwrap_or(Value::Null);
         payload["gpus"] = Value::Array(gpus);
         payload["mem"] = mem::sample_memory();

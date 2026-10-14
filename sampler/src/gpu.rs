@@ -138,10 +138,56 @@ fn parse_nvidia_line(line: &str) -> Option<(String, Value)> {
     Some((normalize_slot(parts[0]), snapshot))
 }
 
+/// One process's share of an NVIDIA card, from `nvidia-smi pmon`.
+pub struct NvidiaProcess {
+    pub slot: String,
+    pub pid: u32,
+    pub name: String,
+    pub util: f64,
+    pub mem: f64,
+}
+
+/// `nvidia-smi pmon` rows. Columns differ between driver versions, so they
+/// are found by the header; "-" means the process did not use that part.
+fn parse_pmon(out: &str, slots: &HashMap<String, String>) -> Vec<NvidiaProcess> {
+    let mut columns: Vec<String> = Vec::new();
+    let mut rows = Vec::new();
+    for line in out.lines() {
+        if let Some(header) = line.strip_prefix('#') {
+            if columns.is_empty() {
+                columns = header.split_whitespace().map(str::to_string).collect();
+            }
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let at = |name: &str| {
+            columns
+                .iter()
+                .position(|c| c == name)
+                .and_then(|i| parts.get(i).copied())
+        };
+        let (Some(index), Some(pid)) = (at("gpu"), at("pid").and_then(|p| p.parse().ok())) else {
+            continue;
+        };
+        let Some(slot) = slots.get(index) else { continue };
+        let num = |name: &str| at(name).and_then(|v| v.parse::<f64>().ok());
+        rows.push(NvidiaProcess {
+            slot: slot.clone(),
+            pid,
+            name: bounded_text(at("command").unwrap_or(""), EXTERNAL_TEXT_LIMIT),
+            util: num("sm").unwrap_or(0.0),
+            mem: num("fb").unwrap_or(0.0) * 1024.0 * 1024.0,
+        });
+    }
+    rows
+}
+
 pub struct GpuSampler {
     cards: Vec<GpuCard>,
     latest: Arc<Mutex<HashMap<String, Value>>>,
     child: Option<Child>,
+    /// nvidia-smi's card index to PCI address, looked up on first use.
+    nvidia_slots: Option<HashMap<String, String>>,
 }
 
 impl GpuSampler {
@@ -150,6 +196,7 @@ impl GpuSampler {
             cards: Vec::new(),
             latest: Arc::new(Mutex::new(HashMap::new())),
             child: None,
+            nvidia_slots: None,
         };
         sampler.detect();
         sampler
@@ -337,6 +384,42 @@ impl GpuSampler {
         })
     }
 
+    /// PCI addresses of the cards built into the processor.
+    pub fn integrated_slots(&self) -> Vec<String> {
+        self.cards
+            .iter()
+            .filter(|c| c.integrated)
+            .map(|c| c.slot.clone())
+            .collect()
+    }
+
+    /// What each process uses of every NVIDIA card. The proprietary driver
+    /// publishes no per-client counters in fdinfo, so this asks nvidia-smi.
+    pub fn nvidia_processes(&mut self) -> Vec<NvidiaProcess> {
+        if self.child.is_none() {
+            return Vec::new();
+        }
+        let slots = self.nvidia_slots.get_or_insert_with(|| {
+            run(
+                "nvidia-smi",
+                &["--query-gpu=index,pci.bus_id", "--format=csv,noheader"],
+                Duration::from_secs(2),
+            )
+            .lines()
+            .filter_map(|line| {
+                let (index, bus) = line.split_once(',')?;
+                Some((index.trim().to_string(), normalize_slot(bus)))
+            })
+            .collect()
+        });
+        let out = run(
+            "nvidia-smi",
+            &["pmon", "-c", "1", "-s", "um"],
+            Duration::from_secs(2),
+        );
+        parse_pmon(&out, slots)
+    }
+
     /// Every detected GPU, boot display first.
     pub fn sample_all(&self) -> Vec<Value> {
         self.cards.iter().map(|c| self.sample_card(c)).collect()
@@ -436,12 +519,33 @@ mod tests {
             cards: vec![card(Kind::Nvidia, "0000:01:00.0", true)],
             latest: Arc::new(Mutex::new(HashMap::new())),
             child: None,
+            nvidia_slots: None,
         };
         let readings = sampler.sample_all();
         assert_eq!(readings.len(), 1);
         assert_eq!(readings[0]["id"], "0000:01:00.0");
         assert_eq!(readings[0]["vendor"], "nvidia");
         assert!(readings[0]["util"].is_null());
+    }
+
+    #[test]
+    fn pmon_rows_follow_the_header_and_card_index() {
+        let out = "\
+# gpu         pid   type     sm    mem    enc    dec    jpg    ofa     fb   ccpm    command
+# Idx           #    C/G      %      %      %      %      %      %     MB     MB    name
+    0      37129     C      -      -      -      -      -      -   6196      0    llama-server
+    0    1904057     G     30      1      -      -      -      -      6      0    Hyprland
+    1        812     G      4      0      -      -      -      -     12      0    other-card
+";
+        let slots = HashMap::from([("0".to_string(), "0000:01:00.0".to_string())]);
+        let rows = parse_pmon(out, &slots);
+        assert_eq!(rows.len(), 2, "rows on an unknown card are dropped");
+        assert_eq!(rows[0].pid, 37129);
+        assert_eq!(rows[0].util, 0.0);
+        assert_eq!(rows[0].mem, 6196.0 * 1024.0 * 1024.0);
+        assert_eq!(rows[1].name, "Hyprland");
+        assert_eq!(rows[1].util, 30.0);
+        assert_eq!(rows[1].slot, "0000:01:00.0");
     }
 
     #[test]
