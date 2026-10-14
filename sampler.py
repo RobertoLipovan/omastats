@@ -267,6 +267,7 @@ class CpuSampler:
         self.prev_cores: list[list[int]] | None = None
         self.static = self._static_info()
         self.temp_source = self._find_temp_source()
+        self.power = PowerSource()
         self.freq_paths = [
             f"/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq"
             for i in range(self.static["threads"])
@@ -424,7 +425,81 @@ class CpuSampler:
             "threadCount": self.static["threads"],
             "efficiency": self.static["efficiency"],
             "temp": temp,
+            "power": self.power.watts(),
         }
+
+
+def is_apu_hwmon(base: str) -> bool:
+    """Only an APU's amdgpu reports a northbridge voltage (vddnb)."""
+    return any(
+        entry.startswith("in") and entry.endswith("_label") and read_text(f"{base}/{entry}") == "vddnb"
+        for entry in list_dir(base)
+    )
+
+
+def apu_package_power() -> str | None:
+    """The amdgpu hwmon power reading of an APU, which is the package's."""
+    for hw in list_dir("/sys/class/hwmon"):
+        base = f"/sys/class/hwmon/{hw}"
+        if read_text(f"{base}/name") != "amdgpu" or not is_apu_hwmon(base):
+            continue
+        for key in ("power1_input", "power1_average"):
+            if os.path.exists(f"{base}/{key}"):
+                return f"{base}/{key}"
+    return None
+
+
+def ppt_watts(raw: float) -> float:
+    """hwmon reports microwatts, but amdgpu on some desktop APUs (Ryzen 7000
+    and 9000) reports milliwatts, so a running package would read under a
+    watt. Below a watt, a value plausible as milliwatts is read as such."""
+    watts = raw / 1e6
+    return raw / 1e3 if watts < 1 and raw / 1e3 <= 300 else watts
+
+
+def energy_delta(now: int, before: int, limit: int) -> int:
+    """Microjoules used between two counter readings, across one wraparound."""
+    if now >= before:
+        return now - before
+    return limit - before + now if limit > before else 0
+
+
+class PowerSource:
+    """CPU package power. RAPL energy counters are the direct reading, but the
+    kernel makes them root-only unless a udev rule opens them. An AMD APU's
+    graphics driver reports the whole package as its PPT, readable by anyone,
+    so that stands in for RAPL there."""
+
+    def __init__(self) -> None:
+        self.packages: list[tuple[str, int]] = []
+        self.prev: tuple[list[int], float] | None = None
+        for zone in sorted(list_dir("/sys/class/powercap")):
+            base = f"/sys/class/powercap/{zone}"
+            if zone.count(":") != 1 or not read_text(f"{base}/name").startswith("package"):
+                continue
+            if os.access(f"{base}/energy_uj", os.R_OK):
+                self.packages.append((f"{base}/energy_uj", read_int(f"{base}/max_energy_range_uj", 0) or 0))
+        self.ppt = None if self.packages else apu_package_power()
+
+    def watts(self) -> float | None:
+        if self.packages:
+            now = time.monotonic()
+            energy = [read_int(path) for path, _ in self.packages]
+            if any(value is None for value in energy):
+                return None
+            watts = None
+            if self.prev is not None and now > self.prev[1]:
+                joules = sum(
+                    energy_delta(value, before, limit) / 1e6
+                    for value, before, (_, limit) in zip(energy, self.prev[0], self.packages)
+                )
+                watts = round(joules / (now - self.prev[1]), 1)
+            self.prev = (energy, now)
+            return watts
+        if self.ppt:
+            raw = parse_float(RUNTIME_PM.read_hwmon(self.ppt))
+            return round(ppt_watts(raw), 1) if raw is not None else None
+        return None
 
 
 # ---------------------------------------------------------------------- Runtime PM
@@ -531,6 +606,42 @@ class GpuCard:
         for hw in list_dir(f"{device}/hwmon"):
             self.hwmon = f"{device}/hwmon/{hw}"
             break
+        # Built into the processor: an AMD APU reports a northbridge voltage;
+        # Intel's integrated graphics always sit on the root bus.
+        if kind == "amd":
+            self.integrated = bool(self.hwmon) and is_apu_hwmon(self.hwmon)
+        else:
+            self.integrated = kind == "intel" and self.slot.startswith("0000:00:")
+
+
+def parse_pmon(out: str, slots: dict[str, str]) -> list[dict]:
+    """`nvidia-smi pmon` rows. Columns differ between driver versions, so they
+    are found by the header; "-" means the process did not use that part."""
+    columns: list[str] = []
+    rows: list[dict] = []
+    for line in out.splitlines():
+        if line.startswith("#"):
+            if not columns:
+                columns = line[1:].split()
+            continue
+        parts = line.split()
+
+        def at(name: str) -> str | None:
+            index = columns.index(name) if name in columns else -1
+            return parts[index] if 0 <= index < len(parts) else None
+
+        slot = slots.get(at("gpu") or "")
+        pid = parse_int(at("pid") or "")
+        if slot is None or pid is None:
+            continue
+        rows.append({
+            "slot": slot,
+            "pid": pid,
+            "name": bounded_text(at("command") or ""),
+            "util": parse_float(at("sm") or "", 0.0),
+            "mem": (parse_float(at("fb") or "", 0.0) or 0.0) * 1024 * 1024,
+        })
+    return rows
 
 
 def order_cards(cards: list[GpuCard]) -> list[GpuCard]:
@@ -673,11 +784,13 @@ class GpuSampler:
         else:
             mhz = read_float(f"{card_dir}/gt_cur_freq_mhz") or read_float(f"{card_dir}/gt/gt0/rps_cur_freq_mhz")
         temp = self._hwmon_value(entry.hwmon, "temp", ("edge", "junction"))
-        power = self._hwmon_value(entry.hwmon, "power", ("ppt", "power"))
+        # An APU's PPT is the whole package's power, shown as CPU power.
+        power = None if entry.integrated else self._hwmon_value(entry.hwmon, "power", ("ppt", "power"))
         return {
             "id": entry.slot,
             "name": entry.name or ("AMD" if entry.kind == "amd" else "Intel"),
             "vendor": entry.kind,
+            "integrated": entry.integrated,
             "util": parse_float(RUNTIME_PM.read(entry.device, f"{entry.device}/gpu_busy_percent")),
             "memUsed": read_float(f"{entry.device}/mem_info_vram_used"),
             "memTotal": read_float(f"{entry.device}/mem_info_vram_total"),

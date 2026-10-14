@@ -93,5 +93,20 @@ class RuntimePmTests(unittest.TestCase):
             self.assertEqual(gate.read(str(device), busy, 101.0), "80")
 
 
+class CpuPowerTests(unittest.TestCase):
+    def test_ppt_in_milliwatts_is_recognised(self):
+        watts = NAMESPACE["ppt_watts"]
+        self.assertEqual(watts(15_000_000), 15.0)
+        self.assertEqual(watts(165_000), 165.0)
+        self.assertEqual(watts(800_000), 0.8)
+
+    def test_energy_counters_survive_one_wraparound(self):
+        delta = NAMESPACE["energy_delta"]
+        self.assertEqual(delta(1_500, 1_000, 10_000), 500)
+        self.assertEqual(delta(200, 9_800, 10_000), 400)
+        self.assertEqual(delta(200, 9_800, 0), 0)
+
+
+
 if __name__ == "__main__":
     unittest.main()

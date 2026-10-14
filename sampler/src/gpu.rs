@@ -1,3 +1,4 @@
+use crate::cpu;
 use crate::pm;
 use crate::util::{
     bounded_text, kill_process_group, list_dir, opt_f64, read_bounded_line, read_f64, read_text,
@@ -47,6 +48,8 @@ struct GpuCard {
     hwmon: Option<String>,
     /// The firmware's boot display, which may be integrated or discrete.
     boot_vga: bool,
+    /// Built into the processor, sharing system memory.
+    integrated: bool,
 }
 
 impl GpuCard {
@@ -66,6 +69,13 @@ impl GpuCard {
             .unwrap_or_default()
             .trim()
             == "1";
+        // An AMD APU reports a northbridge voltage; Intel's integrated
+        // graphics always sit on the root bus.
+        let integrated = match kind {
+            Kind::Amd => hwmon.as_deref().is_some_and(cpu::is_apu_hwmon),
+            Kind::Intel => slot.starts_with("0000:00:"),
+            Kind::Nvidia => false,
+        };
         Self {
             kind,
             device,
@@ -73,6 +83,7 @@ impl GpuCard {
             name: String::new(),
             hwmon,
             boot_vga,
+            integrated,
         }
     }
 }
@@ -299,8 +310,13 @@ impl GpuSampler {
             .unwrap_or_default();
         let temp = Self::hwmon_value(card.hwmon.as_ref(), "temp", &["edge", "junction"])
             .map(|t| t / 1000.0);
-        let power = Self::hwmon_value(card.hwmon.as_ref(), "power", &["ppt", "power"])
-            .map(|p| p / 1_000_000.0);
+        // An APU's PPT is the whole package's power, shown as CPU power.
+        let power = if card.integrated {
+            None
+        } else {
+            Self::hwmon_value(card.hwmon.as_ref(), "power", &["ppt", "power"])
+                .map(|p| p / 1_000_000.0)
+        };
         let mhz = Self::hwmon_value(card.hwmon.as_ref(), "freq", &["sclk"])
             .map(|f| f / 1_000_000.0)
             .or_else(|| read_f64(format!("{parent}/gt_cur_freq_mhz")))
@@ -309,6 +325,7 @@ impl GpuSampler {
             "id": card.slot,
             "name": if card.name.is_empty() { card.kind.fallback_name() } else { card.name.as_str() },
             "vendor": card.kind.vendor(),
+            "integrated": card.integrated,
             "util": opt_f64(pm::read_f64(device, &format!("{device}/gpu_busy_percent"))),
             "memUsed": opt_f64(read_f64(format!("{device}/mem_info_vram_used"))),
             "memTotal": opt_f64(read_f64(format!("{device}/mem_info_vram_total"))),
@@ -378,6 +395,7 @@ mod tests {
             name: String::new(),
             hwmon: None,
             boot_vga,
+            integrated: false,
         }
     }
 

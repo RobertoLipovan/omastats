@@ -785,6 +785,14 @@ function freqText(mhz) {
   return m >= 1000 ? (m / 1000).toFixed(2) + " GHz" : Math.round(m) + " MHz"
 }
 
+// "167 W" for a power reading, or "" when there is none.
+function wattsText(watts) {
+  if (watts === null || watts === undefined || watts === "") return ""
+  var w = Number(watts)
+  if (!isFinite(w) || w < 0) return ""
+  return (w < 10 ? w.toFixed(1) : String(Math.round(w))) + " W"
+}
+
 // Bar-width-friendly clock, shown instead of a load figure by a card that
 // reports no utilisation.
 function compactFreq(mhz) {

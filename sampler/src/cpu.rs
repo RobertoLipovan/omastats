@@ -1,7 +1,9 @@
 use crate::util::{
     bounded_text, hwmon_dirs, list_dir, read_i64, read_text, round1, EXTERNAL_TEXT_LIMIT,
 };
+use crate::pm;
 use serde_json::{json, Value};
+use std::time::Instant;
 
 const TEMP_PREFERENCE: [&str; 6] = [
     "k10temp",
@@ -22,6 +24,133 @@ pub struct CpuSampler {
     max_mhz: i64,
     temp_source: Option<String>,
     freq_paths: Vec<String>,
+    power: PowerSource,
+}
+
+/// Where the package power comes from. RAPL energy counters are the direct
+/// reading, but the kernel makes them root-only unless a udev rule opens them.
+/// An AMD APU's graphics driver reports the whole package as its PPT, readable
+/// by anyone, so that stands in for RAPL there.
+enum PowerSource {
+    Rapl {
+        /// energy_uj and max_energy_range_uj of each package.
+        packages: Vec<(String, u64)>,
+        prev: Option<(Vec<u64>, Instant)>,
+    },
+    Ppt(String),
+    None,
+}
+
+impl PowerSource {
+    fn find() -> Self {
+        let mut packages = Vec::new();
+        for zone in list_dir("/sys/class/powercap") {
+            let base = format!("/sys/class/powercap/{zone}");
+            let is_package = zone.matches(':').count() == 1
+                && read_text(format!("{base}/name"))
+                    .is_some_and(|name| name.starts_with("package"));
+            let energy = format!("{base}/energy_uj");
+            if is_package && std::fs::File::open(&energy).is_ok() {
+                let range = read_text(format!("{base}/max_energy_range_uj"))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                packages.push((energy, range));
+            }
+        }
+        if !packages.is_empty() {
+            packages.sort();
+            return PowerSource::Rapl {
+                packages,
+                prev: None,
+            };
+        }
+        match apu_package_power() {
+            Some(path) => PowerSource::Ppt(path),
+            None => PowerSource::None,
+        }
+    }
+
+    /// Package power in watts.
+    fn watts(&mut self) -> Option<f64> {
+        match self {
+            PowerSource::Rapl { packages, prev } => {
+                let now = Instant::now();
+                let energy: Option<Vec<u64>> = packages
+                    .iter()
+                    .map(|(path, _)| read_text(path).and_then(|v| v.parse().ok()))
+                    .collect();
+                let energy = energy?;
+                let watts = prev.as_ref().and_then(|(before, at)| {
+                    let seconds = now.duration_since(*at).as_secs_f64();
+                    if seconds <= 0.0 {
+                        return None;
+                    }
+                    let joules: f64 = energy
+                        .iter()
+                        .zip(before)
+                        .zip(packages.iter())
+                        .map(|((now, before), (_, range))| {
+                            energy_delta(*now, *before, *range) as f64 / 1e6
+                        })
+                        .sum();
+                    Some(joules / seconds)
+                });
+                *prev = Some((energy, now));
+                watts
+            }
+            PowerSource::Ppt(path) => pm::read_hwmon_f64(path).map(ppt_watts),
+            PowerSource::None => None,
+        }
+    }
+}
+
+/// Watts from an APU's PPT. hwmon reports microwatts, but amdgpu on some
+/// desktop APUs (Ryzen 7000 and 9000) reports milliwatts, so a running
+/// package would read under a watt. Below a watt, a value that is plausible
+/// as milliwatts is read as milliwatts.
+fn ppt_watts(raw: f64) -> f64 {
+    let watts = raw / 1e6;
+    if watts < 1.0 && raw / 1e3 <= 300.0 {
+        raw / 1e3
+    } else {
+        watts
+    }
+}
+
+/// Microjoules used between two counter readings, across one wraparound.
+fn energy_delta(now: u64, before: u64, range: u64) -> u64 {
+    if now >= before {
+        now - before
+    } else if range > before {
+        range - before + now
+    } else {
+        0
+    }
+}
+
+/// The amdgpu hwmon of an APU, whose PPT is the package's power. Only an APU
+/// reports a northbridge voltage (vddnb), which tells it from a discrete card.
+pub fn apu_package_power() -> Option<String> {
+    for hw in hwmon_dirs() {
+        let base = format!("/sys/class/hwmon/{hw}");
+        if read_text(format!("{base}/name")).as_deref() != Some("amdgpu") || !is_apu_hwmon(&base) {
+            continue;
+        }
+        for key in ["power1_input", "power1_average"] {
+            if std::path::Path::new(&format!("{base}/{key}")).exists() {
+                return Some(format!("{base}/{key}"));
+            }
+        }
+    }
+    None
+}
+
+pub fn is_apu_hwmon(base: &str) -> bool {
+    list_dir(base).iter().any(|entry| {
+        entry.starts_with("in")
+            && entry.ends_with("_label")
+            && read_text(format!("{base}/{entry}")).as_deref() == Some("vddnb")
+    })
 }
 
 fn cpu_list(raw: &str) -> Vec<usize> {
@@ -130,6 +259,7 @@ impl CpuSampler {
             max_mhz,
             temp_source: Self::find_temp_source(),
             freq_paths,
+            power: PowerSource::find(),
         }
     }
 
@@ -272,6 +402,7 @@ impl CpuSampler {
             .as_ref()
             .and_then(read_i64)
             .map(|raw| round1(raw as f64 / 1000.0));
+        let power = self.power.watts().map(round1);
 
         json!({
             "total": round1(busy),
@@ -288,6 +419,28 @@ impl CpuSampler {
             "threadCount": self.threads,
             "efficiency": self.efficiency,
             "temp": temp,
+            "power": power,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ppt_in_milliwatts_is_recognised() {
+        assert_eq!(ppt_watts(15_000_000.0), 15.0);
+        assert_eq!(ppt_watts(165_000.0), 165.0);
+        // A real sub-watt reading is not mistaken for hundreds of watts.
+        assert_eq!(ppt_watts(800_000.0), 0.8);
+    }
+
+    #[test]
+    fn energy_counters_survive_one_wraparound() {
+        assert_eq!(energy_delta(1_500, 1_000, 10_000), 500);
+        assert_eq!(energy_delta(200, 9_800, 10_000), 400);
+        // Without a known range a backwards counter is a reset, not a spike.
+        assert_eq!(energy_delta(200, 9_800, 0), 0);
     }
 }

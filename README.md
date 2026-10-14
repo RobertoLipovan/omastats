@@ -17,7 +17,7 @@ OmaStats is an independent project and is not affiliated with Bjango.
 
 | Module  | Bar readout                         | Panel                                                                 |
 |---------|-------------------------------------|-----------------------------------------------------------------------|
-| CPU     | glyph · user/system history · %     | User/system history, per-core rings, load, uptime, top processes |
+| CPU     | glyph · user/system history · %     | User/system history, package power, per-core rings, load, uptime, top processes |
 | GPU     | one readout per GPU · history · %   | Its own tab, with aligned load and VRAM histories when reported |
 | Memory  | glyph · used history · %            | Swap and memory rings, breakdown, processes                           |
 | Disks   | per disk: read/write history and rates, space used | Volumes (click to open in Files), activity for all disks or one, processes |
@@ -38,6 +38,15 @@ autosuspend delay (about six seconds by default) and it can still sleep when
 idle. NVIDIA
 cards remain visible when `nvidia-smi` is unavailable. Existing 1.0 tab settings
 keep access to GPU details when upgrading; GPU can then be hidden separately.
+
+The CPU header shows package power when the machine reports it. Intel and AMD
+package energy counters (RAPL, under `/sys/class/powercap`) are root-only by
+default, so OmaStats reads them only if a udev rule makes `energy_uj` readable.
+An AMD processor with integrated graphics needs none: its graphics driver
+reports the package power (PPT), so that reading moves from the Radeon card to
+the CPU, where it belongs. Some Ryzen 7000 and 9000 drivers report it in
+milliwatts instead of microwatts (`sensors` shows "157 mW"); OmaStats corrects
+for that.
 
 ## Install
 

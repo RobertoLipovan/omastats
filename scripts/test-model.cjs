@@ -301,3 +301,11 @@ test("text fields stay read-only until focused, so they never read the clipboard
   }
   assert.ok(fields >= 2);
 });
+
+test("power readings read as watts", () => {
+  assert.equal(model.wattsText(167.04), "167 W");
+  assert.equal(model.wattsText(4.26), "4.3 W");
+  assert.equal(model.wattsText(null), "");
+  assert.equal(model.wattsText(undefined), "");
+  assert.equal(model.wattsText("n/a"), "");
+});

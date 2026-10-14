@@ -27,11 +27,13 @@ Column {
   readonly property var efficiency: Array.isArray(cpu.efficiency) ? cpu.efficiency : []
   readonly property bool hybrid: efficiency.length > 0 && efficiency.length < cores.length
 
-  function headerDetail(mhz, temp) {
+  function headerDetail(mhz, temp, power) {
     var parts = []
     var freq = Model.freqText(mhz)
     if (freq) parts.push(freq)
     if (isFinite(Number(temp)) && temp !== null) parts.push(Model.tempText(temp, temperatureUnit))
+    var watts = Model.wattsText(power)
+    if (watts) parts.push(watts)
     return parts.join(", ")
   }
 
@@ -43,7 +45,7 @@ Column {
 
     CardHeader {
       title: "CPU"
-      detail: root.headerDetail(root.cpu.mhz, root.cpu.temp)
+      detail: root.headerDetail(root.cpu.mhz, root.cpu.temp, root.cpu.power)
       foreground: root.foreground
       fontFamily: root.fontFamily
     }
