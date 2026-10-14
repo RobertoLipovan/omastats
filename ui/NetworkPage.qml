@@ -269,7 +269,7 @@ Column {
     ProcessList {
       host: root.host
       title: "Processes"
-      caption: "TCP traffic per process from the kernel's socket counters. QUIC and other UDP traffic cannot be attributed without root."
+      caption: "Counts TCP only, so some browser and game traffic is missing."
       items: root.connections.slice(0, 6)
       allItems: root.connections
       total: root.connections.length
