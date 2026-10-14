@@ -274,6 +274,22 @@ Item {
     onTriggered: root.restartCount = 0
   }
 
+  // The bar config as saved in shell.json. The copy the shell hands plugins
+  // can stop updating (an API object replaced while plugins load keeps the
+  // config it started with), so widgets check their settings against this.
+  property var savedBarConfig: null
+
+  FileView {
+    path: Quickshell.env("HOME") + "/.config/omarchy/shell.json"
+    watchChanges: true
+    printErrors: false
+    onLoaded: {
+      var bar = Model.parseShellBar(text())
+      if (bar) root.savedBarConfig = bar
+    }
+    onFileChanged: reload()
+  }
+
   // The theme's named colours (red, blue, magenta, …) are not part of the
   // shell's Color singleton, so read colors.toml directly for the graph hues.
   FileView {

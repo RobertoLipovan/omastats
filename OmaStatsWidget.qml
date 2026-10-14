@@ -171,8 +171,14 @@ Panel {
 
   // Some shell versions re-inject a slot's original settings after an inline
   // edit. Keep the widget on the saved entry and use it for subsequent writes.
-  readonly property var savedSettings: Model.savedBarSettings(
-    bar && bar.shell ? bar.shell.barConfig : null, moduleName, locateSelf())
+  // The entry comes from shell.json itself, since the shell's copy can stop
+  // updating, plus this widget's writes that have not reached the file yet.
+  readonly property var savedEntry: Model.savedBarSettings(
+    service && service.savedBarConfig ? service.savedBarConfig : (bar && bar.shell ? bar.shell.barConfig : null),
+    moduleName, locateSelf())
+  property var pendingSettings: ({})
+  readonly property var savedSettings: Model.withPending(savedEntry, pendingSettings)
+  onSavedEntryChanged: pendingSettings = Model.prunePending(savedEntry, pendingSettings, Date.now())
   onSavedSettingsChanged: Qt.callLater(restoreSavedSettings)
 
   function restoreSavedSettings() {
@@ -219,6 +225,10 @@ Panel {
     var next = {}
     for (var k in current) next[k] = current[k]
     next[key] = value
+    var pending = {}
+    for (var p in pendingSettings) pending[p] = pendingSettings[p]
+    pending[key] = { value: value, at: Date.now() }
+    pendingSettings = pending
     settings = next
     if (!bar || !bar.shell) return
     var registry = bar.shell.pluginRegistry

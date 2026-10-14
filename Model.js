@@ -381,6 +381,36 @@ function filterProcesses(list, query, key) {
   return items
 }
 
+// The bar section of shell.json's text, or null when it does not parse.
+function parseShellBar(text) {
+  var config
+  try { config = JSON.parse(String(text || "")) } catch (error) { return null }
+  return config && typeof config === "object" && config.bar && typeof config.bar === "object" ? config.bar : null
+}
+
+// A widget's saved settings with the changes it has written that shell.json
+// does not show yet. pending is {key: {value, at}}.
+function withPending(saved, pending) {
+  if (!saved) return null
+  var out = {}
+  for (var key in saved) out[key] = saved[key]
+  for (var p in pending) out[p] = pending[p].value
+  return out
+}
+
+// Pending changes still waiting for shell.json: one the file now shows is
+// done, and one the file has not shown for ten seconds was overridden.
+function prunePending(saved, pending, now) {
+  var out = {}
+  for (var key in pending) {
+    var entry = pending[key]
+    if (saved && JSON.stringify(saved[key]) === JSON.stringify(entry.value)) continue
+    if (now - entry.at > 10000) continue
+    out[key] = entry
+  }
+  return out
+}
+
 // Read the authoritative inline settings rather than a bar slot's cached
 // copy. Without a location, only a unique entry is safe to identify.
 function savedBarSettings(barConfig, id, location) {

@@ -173,6 +173,7 @@ function persistenceHost(savedEntry, slotSettings, withConfig = true) {
     Model: model,
     moduleName: "crmne.omastats",
     settings: plain(slotSettings),
+    pendingSettings: {},
     locateSelf: () => null,
     bar: { shell: { updateEntryInline: (id, next) => { entry = plain(next); } } },
   });
@@ -220,4 +221,18 @@ test("shells without a saved bar config still persist inline settings", () => {
   widget.restoreSavedSettings();
   assert.equal(savedEntry().barDisks, "nvme1n1:used");
   assert.equal(widget.settings.graphWidth, 48);
+});
+
+test("settings written but not yet in shell.json stay saved until the file shows them", () => {
+  const bar = model.parseShellBar(JSON.stringify({ version: 1, bar: { layout: { right: [
+    { id: "crmne.omastats", barDisks: "all:speed", graphWidth: 36 }] } } }));
+  assert.equal(model.parseShellBar("{ half-written"), null);
+  const saved = model.savedBarSettings(bar, "crmne.omastats", null);
+  const pending = { barDisks: { value: "sda:used", at: 1000 } };
+  assert.deepEqual(plain(model.withPending(saved, pending)), { barDisks: "sda:used", graphWidth: 36 });
+  assert.equal(model.withPending(null, pending), null);
+  // Still waiting, then landed, then given up on after ten seconds.
+  assert.deepEqual(plain(model.prunePending(saved, pending, 2000)), pending);
+  assert.deepEqual(plain(model.prunePending({ ...saved, barDisks: "sda:used" }, pending, 2000)), {});
+  assert.deepEqual(plain(model.prunePending(saved, pending, 12000)), {});
 });
