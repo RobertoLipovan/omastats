@@ -781,6 +781,9 @@ Column {
       height: Style.space(26)
       text: colorRow.settingColor
       placeholderText: "#RRGGBB"
+      // An editable field asks the clipboard for text whenever another
+      // application changes it. Stay read-only until someone types here.
+      readOnly: !activeFocus
       maximumLength: 7
       horizontalAlignment: TextInput.AlignRight
       foreground: root.foreground

@@ -287,3 +287,17 @@ test("settings written but not yet in shell.json stay saved until the file shows
   assert.deepEqual(plain(model.prunePending({ ...saved, barDisks: "sda:used" }, pending, 2000)), {});
   assert.deepEqual(plain(model.prunePending(saved, pending, 12000)), {});
 });
+
+test("text fields stay read-only until focused, so they never read the clipboard", () => {
+  const dir = path.join(__dirname, "../ui");
+  let fields = 0;
+  for (const file of fs.readdirSync(dir).filter(name => name.endsWith(".qml"))) {
+    const source = fs.readFileSync(path.join(dir, file), "utf8");
+    for (const block of source.split(/^\s*TextField \{/m).slice(1)) {
+      fields += 1;
+      const body = block.slice(0, block.search(/^\s{0,4}\}/m));
+      assert.match(body, /readOnly: !activeFocus/, `${file} has an always-editable TextField`);
+    }
+  }
+  assert.ok(fields >= 2);
+});
