@@ -15,6 +15,10 @@
 //! Cheap counters (CPU, memory, network and disk rates) follow the interval.
 //! Everything that walks many files (processes, sensors, battery, socket
 //! mapping) is sampled at most once a second whatever the interval.
+//!
+//! Per-process figures are differences between two readings. When the panel
+//! opens, the first reading is taken and the second follows after
+//! `WARM_UP`, so the lists show real figures at once instead of zeros.
 
 mod battery;
 mod cpu;
@@ -46,6 +50,9 @@ struct Control {
 /// loop so a new interval or detail level applies at once instead of after
 /// the rest of the old interval.
 type Shared = Arc<(Mutex<Control>, Condvar)>;
+
+/// Gap between the two readings that start per-process figures.
+const WARM_UP: Duration = Duration::from_millis(250);
 
 fn bounded_output_line(
     payload: &Value,
@@ -187,6 +194,7 @@ fn main() {
     let mut battery_cache = Value::Null;
     let mut procs_cache = Value::Null;
     let mut connections_cache = Value::Null;
+    let mut network_primed = false;
 
     loop {
         let (detail, focus, want_public, current_interval, stop) = {
@@ -207,6 +215,19 @@ fn main() {
         if stop {
             break;
         }
+        let want_network = detail > 0 && focus == "network";
+        let cold_procs = detail > 0 && last_procs.is_none();
+        let cold_network = want_network && !network_primed;
+        if cold_procs || cold_network {
+            if cold_procs {
+                let _ = procs.sample(1.0, false);
+                last_procs = Some(Instant::now());
+            }
+            if cold_network {
+                let _ = procs.network_usage(false);
+            }
+            std::thread::sleep(WARM_UP);
+        }
         let tick_start = Instant::now();
         let elapsed = tick_start.duration_since(last).as_secs_f64().max(0.02);
         last = tick_start;
@@ -215,24 +236,31 @@ fn main() {
             net.fetch_public_ip();
         }
 
-        let slow_due = last_slow.is_none_or(|t| tick_start.duration_since(t).as_secs_f64() >= 0.95);
+        // A freshly opened panel or page reads at once rather than waiting
+        // for the next once-a-second pass.
+        let slow_due = cold_procs
+            || cold_network
+            || last_slow.is_none_or(|t| tick_start.duration_since(t).as_secs_f64() >= 0.95);
         if slow_due {
             sensors_cache = sensors.sample(now);
             battery_cache = battery::sample_battery();
             if detail > 0 {
+                let read_at = Instant::now();
                 let since = last_procs.map_or(elapsed, |t| {
-                    tick_start.duration_since(t).as_secs_f64().max(0.05)
+                    read_at.duration_since(t).as_secs_f64().max(0.05)
                 });
                 procs_cache = procs.sample(since, detail >= 2);
-                last_procs = Some(tick_start);
+                last_procs = Some(read_at);
             } else {
                 procs.reset();
                 procs_cache = Value::Null;
                 last_procs = None;
             }
-            connections_cache = if detail > 0 && focus == "network" {
+            connections_cache = if want_network {
+                network_primed = true;
                 procs.network_usage(detail >= 2)
             } else {
+                network_primed = false;
                 Value::Null
             };
             last_slow = Some(tick_start);

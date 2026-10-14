@@ -50,6 +50,8 @@ PROCESS_SCAN_LIMIT = 16_384
 FD_SCAN_LIMIT = 4096
 SOCKET_SCAN_LIMIT = 16_384
 PROC_FILE_LIMIT = 64 * 1024
+# Gap between the two readings that start per-process figures.
+WARM_UP = 0.25
 TOOL_DIRS = ("/usr/bin", "/bin")
 
 
@@ -1913,23 +1915,42 @@ def main() -> int:
     battery_cache: dict | None = None
     procs_cache: dict | None = None
     connections_cache: list | None = None
+    network_primed = False
 
     while not controller.stop:
-        now_mono = time.monotonic()
-        elapsed = max(0.02, now_mono - last)
-        last = now_mono
-        now = time.time()
         with controller.lock:
             detail = controller.detail
             focus = controller.focus
             want_public = controller.public_ip_requested
             controller.public_ip_requested = False
             current_interval = controller.interval
+        want_network = bool(detail) and focus == "network"
+        cold_procs = bool(detail) and last_procs is None
+        cold_network = want_network and not network_primed
+        # Per-process figures are differences between two readings. When the
+        # panel opens, the first reading is taken and the second follows after
+        # WARM_UP, so the lists show real figures at once instead of zeros.
+        if cold_procs or cold_network:
+            try:
+                if cold_procs:
+                    procs.sample(1.0, False)
+                    last_procs = time.monotonic()
+                if cold_network:
+                    procs.network_usage(False)
+            except Exception:  # noqa: BLE001 - the real reading reports errors
+                pass
+            time.sleep(WARM_UP)
+        now_mono = time.monotonic()
+        elapsed = max(0.02, now_mono - last)
+        last = now_mono
+        now = time.time()
         if want_public:
             net.fetch_public_ip()
 
         payload: dict = {"seq": seq, "t": now, "elapsed": round(elapsed, 3), "interval": current_interval, "errors": []}
-        slow_due = last_slow is None or now_mono - last_slow >= 0.95
+        # A freshly opened panel or page reads at once rather than waiting for
+        # the next once-a-second pass.
+        slow_due = cold_procs or cold_network or last_slow is None or now_mono - last_slow >= 0.95
         if slow_due:
             try:
                 sensors_cache = sensors.sample(now)
@@ -1954,7 +1975,8 @@ def main() -> int:
                 procs_cache = None
                 last_procs = None
             connections_cache = None
-            if detail and focus == "network":
+            network_primed = want_network
+            if want_network:
                 try:
                     connections_cache = procs.network_usage(detail >= 2)
                 except Exception as error:  # noqa: BLE001

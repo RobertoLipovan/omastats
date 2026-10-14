@@ -205,7 +205,10 @@ Several instances are allowed, so modules can be spread across the bar:
 
 The sampler reads cheap counters at the chosen interval and everything that
 walks many files (processes, sensors, battery, socket mapping) at most once a
-second, so 0.1 s refresh stays inexpensive. Per-process network traffic comes
+second, so 0.1 s refresh stays inexpensive. Per-process figures are differences
+between two readings, so when the panel opens the sampler takes the first
+reading and the second a quarter of a second later, and the lists open with real
+figures. Per-process network traffic comes
 from the kernel's per-socket TCP byte counters (the same ones `ss -ti` shows),
 differenced once a second and tied to processes through `/proc`, so it needs no
 root. UDP, and therefore QUIC, carries no such counters and is not attributed.
