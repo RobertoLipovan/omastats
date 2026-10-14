@@ -32,6 +32,7 @@ struct Volume {
 
 pub struct DiskSampler {
     prev: HashMap<String, (u64, u64)>,
+    ids: HashMap<String, String>,
     volumes: Vec<Volume>,
     volumes_stamp: f64,
     drive_temps: HashMap<String, String>,
@@ -134,6 +135,60 @@ fn parse_zpool_leaves(raw: &str) -> HashMap<String, String> {
     leaves
 }
 
+/// Rank of a `/dev/disk/by-id` link as a disk's saved identity: links built
+/// from the model and serial first, then bus-level identifiers such as a WWN
+/// or EUI. Links to partitions and to stacked devices never name a disk.
+fn by_id_rank(link: &str) -> Option<usize> {
+    if link.contains("-part") || ["dm-", "md-", "lvm-"].iter().any(|p| link.starts_with(p)) {
+        return None;
+    }
+    if link.starts_with("nvme-eui.") || link.starts_with("nvme-nvme.") {
+        return Some(6);
+    }
+    Some(
+        ["nvme-", "ata-", "usb-", "mmc-", "virtio-", "scsi-"]
+            .iter()
+            .position(|p| link.starts_with(p))
+            .unwrap_or(7),
+    )
+}
+
+/// Pick each disk's identity from its by-id links. The kernel names disks in
+/// the order their controllers probe, so `nvme0n1` can be a different drive
+/// after a reboot; the model-and-serial link stays with the drive.
+fn pick_disk_ids(links: &[(String, String)]) -> HashMap<String, String> {
+    let mut best: HashMap<String, (usize, usize, String)> = HashMap::new();
+    for (link, disk) in links {
+        let Some(rank) = by_id_rank(link) else {
+            continue;
+        };
+        let candidate = (rank, link.len(), link.clone());
+        match best.get(disk) {
+            Some(current) if *current <= candidate => {}
+            _ => {
+                best.insert(disk.clone(), candidate);
+            }
+        }
+    }
+    best.into_iter()
+        .map(|(disk, (_, _, link))| (disk, link))
+        .collect()
+}
+
+fn scan_disk_ids() -> HashMap<String, String> {
+    let dir = "/dev/disk/by-id";
+    let links: Vec<(String, String)> = list_dir(dir)
+        .into_iter()
+        .filter(|link| link.len() <= EXTERNAL_TEXT_LIMIT)
+        .filter_map(|link| {
+            let target = std::fs::read_link(format!("{dir}/{link}")).ok()?;
+            let disk = target.file_name()?.to_string_lossy().to_string();
+            Some((link, disk))
+        })
+        .collect();
+    pick_disk_ids(&links)
+}
+
 fn parent_disk(device: &str) -> String {
     let real = std::fs::canonicalize(device)
         .map(|p| p.to_string_lossy().to_string())
@@ -181,6 +236,7 @@ impl DiskSampler {
     pub fn new() -> Self {
         let mut sampler = Self {
             prev: HashMap::new(),
+            ids: HashMap::new(),
             volumes: Vec::new(),
             volumes_stamp: 0.0,
             drive_temps: HashMap::new(),
@@ -355,6 +411,11 @@ impl DiskSampler {
             current.insert(name.to_string(), (read_sectors * 512, write_sectors * 512));
         }
 
+        // Disks come and go with hotplug; look their identities up again then.
+        if current.len() != self.prev.len() || current.keys().any(|k| !self.prev.contains_key(k)) {
+            self.ids = scan_disk_ids();
+        }
+
         let mut per_disk = Map::new();
         let mut temps: HashMap<String, Option<f64>> = HashMap::new();
         let mut total_read = 0.0;
@@ -370,9 +431,10 @@ impl DiskSampler {
                 .filter(|t| *t > 0)
                 .map(|t| round1(t as f64 / 1000.0));
             temps.insert(name.clone(), temp);
+            let id = self.ids.get(name).unwrap_or(name);
             per_disk.insert(
                 name.clone(),
-                json!({ "read": read_rate, "write": write_rate, "temp": temp }),
+                json!({ "id": id, "read": read_rate, "write": write_rate, "temp": temp }),
             );
             total_read += read_rate;
             total_write += write_rate;
@@ -427,6 +489,42 @@ mod tests {
         let space = parse_zfs_space(raw);
         assert_eq!(space.len(), 1);
         assert_eq!(space["tank"], (849022443520, 123012960256));
+    }
+
+    #[test]
+    fn disks_are_identified_by_model_and_serial() {
+        let links: Vec<(String, String)> = [
+            ("nvme-eui.0025385991b33317", "nvme1n1"),
+            (
+                "nvme-Samsung_SSD_970_EVO_Plus_1TB_S4EWNF0M921645X_1",
+                "nvme1n1",
+            ),
+            (
+                "nvme-Samsung_SSD_970_EVO_Plus_1TB_S4EWNF0M921645X",
+                "nvme1n1",
+            ),
+            (
+                "nvme-Samsung_SSD_970_EVO_Plus_1TB_S4EWNF0M921645X-part1",
+                "nvme1n1p1",
+            ),
+            ("wwn-0x5002538e40e5728a", "sda"),
+            ("scsi-SATA_Samsung_SSD_860_S4CYNF0M312756K", "sda"),
+            ("ata-Samsung_SSD_860_QVO_2TB_S4CYNF0M312756K", "sda"),
+            ("wwn-0x500a0751e2247779", "sdb"),
+            ("dm-name-root", "dm-0"),
+        ]
+        .iter()
+        .map(|(l, d)| (l.to_string(), d.to_string()))
+        .collect();
+        let ids = pick_disk_ids(&links);
+        assert_eq!(
+            ids["nvme1n1"],
+            "nvme-Samsung_SSD_970_EVO_Plus_1TB_S4EWNF0M921645X"
+        );
+        assert_eq!(ids["sda"], "ata-Samsung_SSD_860_QVO_2TB_S4CYNF0M312756K");
+        assert_eq!(ids["sdb"], "wwn-0x500a0751e2247779");
+        assert!(!ids.contains_key("nvme1n1p1"));
+        assert!(!ids.contains_key("dm-0"));
     }
 
     #[test]

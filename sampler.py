@@ -806,9 +806,58 @@ def parse_zpool_leaves(raw: str) -> dict[str, str]:
     return leaves
 
 
+def by_id_rank(link: str) -> int | None:
+    """Rank a /dev/disk/by-id link as a disk's saved identity.
+
+    Links built from the model and serial come first, then bus-level
+    identifiers such as a WWN or EUI. Partition and stacked-device links
+    never name a disk.
+    """
+    if "-part" in link or link.startswith(("dm-", "md-", "lvm-")):
+        return None
+    if link.startswith(("nvme-eui.", "nvme-nvme.")):
+        return 6
+    for rank, prefix in enumerate(("nvme-", "ata-", "usb-", "mmc-", "virtio-", "scsi-")):
+        if link.startswith(prefix):
+            return rank
+    return 7
+
+
+def pick_disk_ids(links: list[tuple[str, str]]) -> dict[str, str]:
+    """Pick each disk's identity from its by-id links.
+
+    The kernel names disks in the order their controllers probe, so nvme0n1
+    can be a different drive after a reboot; the model-and-serial link stays
+    with the drive.
+    """
+    best: dict[str, tuple[int, int, str]] = {}
+    for link, disk in links:
+        rank = by_id_rank(link)
+        if rank is None:
+            continue
+        candidate = (rank, len(link), link)
+        if disk not in best or candidate < best[disk]:
+            best[disk] = candidate
+    return {disk: link for disk, (_, _, link) in best.items()}
+
+
+def scan_disk_ids() -> dict[str, str]:
+    base = "/dev/disk/by-id"
+    links = []
+    for link in list_dir(base):
+        if len(link) > EXTERNAL_TEXT_LIMIT:
+            continue
+        try:
+            links.append((link, os.path.basename(os.readlink(f"{base}/{link}"))))
+        except OSError:
+            continue
+    return pick_disk_ids(links)
+
+
 class DiskSampler:
     def __init__(self) -> None:
         self.prev: dict[str, tuple[int, int]] = {}
+        self.ids: dict[str, str] = {}
         self.volumes_cache: list[dict] = []
         self.volumes_stamp = 0.0
         self.drive_temps: dict[str, str] = {}
@@ -950,6 +999,9 @@ class DiskSampler:
             if (read_int(f"/sys/block/{name}/size", 0) or 0) <= 0:
                 continue
             current[name] = (int(parts[5]) * 512, int(parts[9]) * 512)
+        # Disks come and go with hotplug; look their identities up again then.
+        if current.keys() != self.prev.keys():
+            self.ids = scan_disk_ids()
         per_disk: dict[str, dict] = {}
         total_read = 0.0
         total_write = 0.0
@@ -960,6 +1012,7 @@ class DiskSampler:
             temp_path = self.drive_temps.get(name)
             temp = read_int(temp_path) if temp_path else None
             per_disk[name] = {
+                "id": self.ids.get(name, name),
                 "read": read_rate,
                 "write": write_rate,
                 "temp": round(temp / 1000, 1) if temp else None,
@@ -1148,6 +1201,28 @@ class NetworkSampler:
 # ------------------------------------------------------------------------- Sensors
 
 
+def chip_device(hwmon: str) -> str:
+    """The physical device behind a hwmon chip, as the last component of its
+    sysfs path: a PCI or I2C address, which stays put across boots while
+    hwmon numbers follow probe order. NVMe registers hwmon on its nvmeN class
+    device, numbered by probe order too, so use the controller."""
+    real = os.path.realpath(f"{hwmon}/device")
+    if not os.path.exists(real):
+        return ""
+    name = os.path.basename(real)
+    if re.fullmatch(r"nvme\d+", name):
+        name = os.path.basename(os.path.dirname(os.path.dirname(real)))
+    return bounded_text(name)
+
+
+def sensor_id(chip: dict, key: str, shared: bool) -> str:
+    """A sensor's saved identity: the chip and input, plus the chip's device
+    when several chips share a driver name (two NVMe drives, two DIMMs)."""
+    if shared and chip.get("device"):
+        return f"{chip['name']}@{chip['device']}/{key}"
+    return f"{chip['name']}/{key}"
+
+
 class SensorSampler:
     def __init__(self) -> None:
         self.chips: list[dict] = []
@@ -1190,7 +1265,8 @@ class SensorSampler:
             if not temps and not fans:
                 continue
             remaining -= len(temps) + len(fans)
-            chips.append({"name": name, "path": path, "temps": temps, "fans": fans,
+            chips.append({"name": name, "path": path, "device": chip_device(path),
+                          "temps": temps, "fans": fans,
                           "labelled": any(t["label"] for t in temps) or any(f["label"] for f in fans)})
         # Some boards expose the same super-IO chip twice (vendor + generic driver).
         # Keep the labelled instance; drop unlabelled duplicates.
@@ -1252,15 +1328,19 @@ class SensorSampler:
             self._scan()
             self.stamp = now
         temps, fans = [], []
-        name_counts: dict[str, int] = {}
+        # Chips sharing a name are numbered in device order, not probe order,
+        # so "NVMe 1" stays the same drive from boot to boot.
+        devices: dict[str, list[str]] = {}
         for chip in self.chips:
-            name_counts[chip["name"]] = name_counts.get(chip["name"], 0) + 1
-        name_seen: dict[str, int] = {}
+            devices.setdefault(chip["name"], []).append(chip["device"])
+        for siblings in devices.values():
+            siblings.sort()
         for chip in self.chips:
             chip_label = self._pretty_chip(chip["name"])
-            if name_counts[chip["name"]] > 1:
-                name_seen[chip["name"]] = name_seen.get(chip["name"], 0) + 1
-                chip_label = f"{chip_label} {name_seen[chip['name']]}"
+            siblings = devices[chip["name"]]
+            shared = len(siblings) > 1
+            if shared:
+                chip_label = f"{chip_label} {siblings.index(chip['device']) + 1}"
             for temp in chip["temps"]:
                 raw = parse_int(RUNTIME_PM.read_hwmon(temp["path"]))
                 if raw is None or raw <= 0 or raw >= 200_000:
@@ -1268,7 +1348,7 @@ class SensorSampler:
                 label = temp["label"] or (chip_label if len(chip["temps"]) == 1 else f"{chip_label} {temp['key'][4:]}")
                 temps.append({
                     "chip": chip_label,
-                    "id": f"{chip['name']}/{temp['key']}",
+                    "id": sensor_id(chip, temp["key"], shared),
                     "label": label,
                     "value": round(raw / 1000, 1),
                     "max": round(temp["max"] / 1000) if 0 < temp["max"] < 200_000 else 0,
@@ -1279,7 +1359,7 @@ class SensorSampler:
                     continue
                 fans.append({
                     "chip": chip_label,
-                    "id": f"{chip['name']}/{fan['key']}",
+                    "id": sensor_id(chip, fan["key"], shared),
                     "label": fan["label"] or f"Fan {fan['key'][3:]}",
                     "rpm": raw,
                 })

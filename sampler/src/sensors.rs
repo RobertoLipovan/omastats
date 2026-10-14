@@ -4,6 +4,7 @@ use crate::util::{
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::Path;
 
 const GPU_HWMON: [&str; 5] = ["amdgpu", "nouveau", "i915", "xe", "radeon"];
 const SENSOR_LIMIT: usize = 1024;
@@ -26,6 +27,7 @@ struct Fan {
 #[derive(Clone)]
 struct Chip {
     name: String,
+    device: String,
     temps: Vec<Temp>,
     fans: Vec<Fan>,
 }
@@ -83,6 +85,40 @@ fn pretty_chip(name: &str) -> String {
         return "Board".to_string();
     }
     bounded_text(name, EXTERNAL_TEXT_LIMIT)
+}
+
+/// The physical device behind a hwmon chip, as the last component of its
+/// sysfs path: a PCI address or an I2C address, which stay put across boots
+/// while hwmon numbers follow probe order. NVMe registers hwmon on its
+/// `nvmeN` class device, numbered by probe order too, so use the controller.
+fn chip_device(hwmon: &str) -> String {
+    let Ok(real) = std::fs::canonicalize(format!("{hwmon}/device")) else {
+        return String::new();
+    };
+    let base = |p: &Path| p.file_name().map(|n| n.to_string_lossy().to_string());
+    let mut name = base(&real).unwrap_or_default();
+    let numbered = |prefix: &str, n: &str| {
+        n.strip_prefix(prefix)
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if numbered("nvme", &name) {
+        name = real
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(base)
+            .unwrap_or_default();
+    }
+    bounded_text(&name, EXTERNAL_TEXT_LIMIT)
+}
+
+/// A sensor's saved identity: the chip and input, plus the chip's device
+/// when several chips share a driver name (two NVMe drives, two DIMMs).
+fn sensor_id(chip: &Chip, key: &str, shared: bool) -> String {
+    if shared && !chip.device.is_empty() {
+        format!("{}@{}/{key}", chip.name, chip.device)
+    } else {
+        format!("{}/{key}", chip.name)
+    }
 }
 
 /// Super-IO monitoring chips, which some boards expose through two drivers
@@ -181,7 +217,12 @@ impl SensorSampler {
             if temps.is_empty() && fans.is_empty() {
                 continue;
             }
-            chips.push(Chip { name, temps, fans });
+            chips.push(Chip {
+                device: chip_device(&path),
+                name,
+                temps,
+                fans,
+            });
         }
         self.chips = dedupe(chips);
         self.gpu_temp_path = None;
@@ -203,18 +244,23 @@ impl SensorSampler {
             self.scan();
             self.stamp = now;
         }
-        let mut name_counts: HashMap<String, usize> = HashMap::new();
+        // Chips sharing a name are numbered in device order, not probe order,
+        // so "NVMe 1" stays the same drive from boot to boot.
+        let mut devices: HashMap<&str, Vec<&str>> = HashMap::new();
         for chip in &self.chips {
-            *name_counts.entry(chip.name.clone()).or_insert(0) += 1;
+            devices.entry(&chip.name).or_default().push(&chip.device);
         }
-        let mut name_seen: HashMap<String, usize> = HashMap::new();
+        for list in devices.values_mut() {
+            list.sort();
+        }
         let mut temps: Vec<Value> = Vec::new();
         let mut fans: Vec<Value> = Vec::new();
         for chip in &self.chips {
             let mut chip_label = pretty_chip(&chip.name);
-            if name_counts.get(&chip.name).copied().unwrap_or(0) > 1 {
-                let n = name_seen.entry(chip.name.clone()).or_insert(0);
-                *n += 1;
+            let siblings = &devices[chip.name.as_str()];
+            let shared = siblings.len() > 1;
+            if shared {
+                let n = siblings.iter().position(|d| *d == chip.device).unwrap_or(0) + 1;
                 chip_label = format!("{chip_label} {n}");
             }
             for temp in &chip.temps {
@@ -231,7 +277,7 @@ impl SensorSampler {
                 };
                 temps.push(json!({
                     "chip": chip_label,
-                    "id": format!("{}/{}", chip.name, temp.key),
+                    "id": sensor_id(chip, &temp.key, shared),
                     "label": label,
                     "value": round1(raw as f64 / 1000.0),
                     "max": if temp.max > 0 && temp.max < 200_000 { (temp.max as f64 / 1000.0).round() as i64 } else { 0 },
@@ -244,7 +290,7 @@ impl SensorSampler {
                 };
                 fans.push(json!({
                     "chip": chip_label,
-                    "id": format!("{}/{}", chip.name, fan.key),
+                    "id": sensor_id(chip, &fan.key, shared),
                     "label": if fan.label.is_empty() { format!("Fan {}", &fan.key[3..]) } else { fan.label.clone() },
                     "rpm": raw,
                 }));
@@ -257,5 +303,32 @@ impl SensorSampler {
             .filter(|v| *v > 0)
             .map(|v| round1(v as f64 / 1000.0));
         json!({ "temps": temps, "fans": fans, "gpuTemp": gpu_temp })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chip(name: &str, device: &str) -> Chip {
+        Chip {
+            name: name.into(),
+            device: device.into(),
+            temps: Vec::new(),
+            fans: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn shared_chip_names_are_told_apart_by_device() {
+        assert_eq!(
+            sensor_id(&chip("k10temp", "0000:00:18.3"), "temp1", false),
+            "k10temp/temp1"
+        );
+        assert_eq!(
+            sensor_id(&chip("nvme", "0000:02:00.0"), "temp1", true),
+            "nvme@0000:02:00.0/temp1"
+        );
+        assert_eq!(sensor_id(&chip("nvme", ""), "temp1", true), "nvme/temp1");
     }
 }

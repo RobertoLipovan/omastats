@@ -26,6 +26,30 @@ def statvfs(path):
 
 
 class DiskTests(unittest.TestCase):
+    def test_disks_are_identified_by_model_and_serial(self):
+        links = [
+            ("nvme-eui.0025385991b33317", "nvme1n1"),
+            ("nvme-Samsung_SSD_970_EVO_Plus_1TB_S4EWNF0M921645X_1", "nvme1n1"),
+            ("nvme-Samsung_SSD_970_EVO_Plus_1TB_S4EWNF0M921645X", "nvme1n1"),
+            ("nvme-Samsung_SSD_970_EVO_Plus_1TB_S4EWNF0M921645X-part1", "nvme1n1p1"),
+            ("wwn-0x5002538e40e5728a", "sda"),
+            ("scsi-SATA_Samsung_SSD_860_S4CYNF0M312756K", "sda"),
+            ("ata-Samsung_SSD_860_QVO_2TB_S4CYNF0M312756K", "sda"),
+            ("wwn-0x500a0751e2247779", "sdb"),
+            ("dm-name-root", "dm-0"),
+        ]
+        self.assertEqual(NAMESPACE["pick_disk_ids"](links), {
+            "nvme1n1": "nvme-Samsung_SSD_970_EVO_Plus_1TB_S4EWNF0M921645X",
+            "sda": "ata-Samsung_SSD_860_QVO_2TB_S4CYNF0M312756K",
+            "sdb": "wwn-0x500a0751e2247779",
+        })
+
+    def test_shared_sensor_chip_names_are_told_apart_by_device(self):
+        sensor_id = NAMESPACE["sensor_id"]
+        self.assertEqual(sensor_id({"name": "k10temp", "device": "0000:00:18.3"}, "temp1", False), "k10temp/temp1")
+        self.assertEqual(sensor_id({"name": "nvme", "device": "0000:02:00.0"}, "temp1", True), "nvme@0000:02:00.0/temp1")
+        self.assertEqual(sensor_id({"name": "nvme", "device": ""}, "temp1", True), "nvme/temp1")
+
     def test_zpool_leaves_are_first_data_devices(self):
         raw = ZPOOL_LIST + "\nlogs\n\t/dev/sdc1\nfast\n\t/dev/sda1\ncache\n\t/dev/sdd1\n"
         self.assertEqual(NAMESPACE["parse_zpool_leaves"](raw),

@@ -25,16 +25,19 @@ Panel {
   // The GPU module expands to one readout per card the user picked, so each
   // entry carries its own PCI address and bar tag.
   readonly property var gpuReadouts: Model.selectedGpus(service ? service.snapshot : ({}), barGpus)
-  // Likewise the disks module: one readout per entry in barDisks. A device
-  // that has gone away is dropped once the sampler has reported any disk.
+  // Likewise the disks module: one readout per entry in barDisks, each saved
+  // by the drive's id and shown under its current kernel name. A device that
+  // has gone away is dropped once the sampler has reported any disk.
   readonly property var diskReadouts: {
-    var perDisk = service && service.snapshot && service.snapshot.disks ? (service.snapshot.disks.perDisk || {}) : {}
+    var snapshot = service ? service.snapshot : null
+    var perDisk = snapshot && snapshot.disks ? (snapshot.disks.perDisk || {}) : {}
     var known = Object.keys(perDisk).length > 0
     var list = Model.barDisks(settings)
     var out = []
     for (var i = 0; i < list.length; i++) {
-      if (list[i].disk !== "all" && known && !perDisk[list[i].disk]) continue
-      out.push(list[i])
+      var name = Model.resolveDisk(snapshot, list[i].disk)
+      if (name === "" && known) continue
+      out.push({ disk: name || list[i].disk, show: list[i].show })
     }
     return out
   }
@@ -243,6 +246,17 @@ Panel {
       for (var e in next) if (e !== "id") entry[e] = next[e]
       bar.shell.updateEntryInline(moduleName, entry)
     }
+  }
+
+  // Disks and sensors saved by kernel name or hwmon driver alone can point at
+  // another device after a reboot. Once the sampler reports identities,
+  // save those instead.
+  readonly property var stableSettings: Model.stableSettings(settings, service ? service.snapshot : null)
+  onStableSettingsChanged: if (stableSettings) Qt.callLater(adoptStableSettings)
+
+  function adoptStableSettings() {
+    var changes = Model.stableSettings(settings, service ? service.snapshot : null)
+    for (var key in changes) persist(key, changes[key])
   }
 
   function resetSettings() {

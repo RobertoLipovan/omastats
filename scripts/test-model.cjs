@@ -122,6 +122,46 @@ test("disk readouts keep the 1.1 bar until barDisks is set", () => {
   assert.deepEqual(["nvme1n1", "sda", "mmcblk0", "all"].map(model.diskShort), ["NV1", "SDA", "MC0", "DSK"]);
 });
 
+test("disk choices follow the drive, not the kernel name it booted with", () => {
+  const kioxia = "nvme-KIOXIA-EXCERIA_G3_SSD_YFWKS0TJZ3TS";
+  const samsung = "nvme-Samsung_SSD_970_EVO_Plus_1TB_S4EWNF0M921645X";
+  const usb = "usb-Micron_CT2000X6SSD9_2305E4919FFA-0:0";
+  const boot = { disks: { perDisk: { nvme0n1: { id: kioxia }, nvme1n1: { id: samsung }, sdd: { id: usb } } } };
+  // The next boot probes the controllers the other way round.
+  const swapped = { disks: { perDisk: { nvme0n1: { id: samsung }, nvme1n1: { id: kioxia }, sdd: { id: usb } } } };
+  assert.equal(model.resolveDisk(boot, kioxia), "nvme0n1");
+  assert.equal(model.resolveDisk(swapped, kioxia), "nvme1n1");
+  assert.equal(model.resolveDisk(swapped, "all"), "all");
+  assert.equal(model.resolveDisk(swapped, "nvme-unplugged"), "");
+  assert.equal(model.resolveDisk(swapped, "nvme0n1"), "nvme0n1");
+  assert.deepEqual(plain(model.diskOptions(boot)).map(option => option.value), ["all", kioxia, samsung, usb]);
+  assert.deepEqual(plain(model.barDisks({ barDisks: `${usb}:both,${kioxia}` })),
+    [{ disk: usb, show: "both" }, { disk: kioxia, show: "speed" }]);
+  assert.deepEqual(plain(model.barDisks({ barDisks: usb })), [{ disk: usb, show: "speed" }]);
+});
+
+test("disks and sensors saved by kernel or driver name move to their ids once", () => {
+  const kioxia = "nvme-KIOXIA-EXCERIA_G3_SSD_YFWKS0TJZ3TS";
+  const snapshot = {
+    disks: { perDisk: { nvme0n1: { id: kioxia }, sda: { id: "ata-Samsung_SSD_860" } } },
+    sensors: { temps: [{ id: "nvme@0000:10:00.0/temp1" }, { id: "nvme@0000:02:00.0/temp1" }, { id: "k10temp/temp1" }],
+      fans: [{ id: "nct6687/fan1" }] },
+  };
+  const legacy = { barDisks: "nvme0n1:used,all:speed,sdz:both", disksSource: "sda",
+    barSensors: "cpu,nvme/temp1,k10temp/temp1,nct6687/fan1" };
+  assert.deepEqual(plain(model.stableSettings(legacy, snapshot)), {
+    barDisks: `${kioxia}:used,all:speed,sdz:both`,
+    disksSource: "ata-Samsung_SSD_860",
+    barSensors: "cpu,nvme@0000:10:00.0/temp1,k10temp/temp1,nct6687/fan1",
+  });
+  const stable = plain(model.withStableSettings(legacy, snapshot));
+  assert.equal(model.stableSettings(stable, snapshot), null);
+  // Defaults, and a sampler that reports no ids yet, leave settings alone.
+  assert.equal(model.stableSettings({}, snapshot), null);
+  assert.equal(model.stableSettings(legacy, { disks: { perDisk: { nvme0n1: {}, sda: {} } } }), null);
+  assert.equal(model.stableSettings(legacy, {}), null);
+});
+
 test("disk space used sums a device's volumes and skips network mounts", () => {
   const snapshot = { disks: {
     perDisk: { nvme0n1: {}, sda: {} },
@@ -180,7 +220,7 @@ function persistenceHost(savedEntry, slotSettings, withConfig = true) {
   Object.defineProperty(widget, "savedSettings", { get: () => withConfig
     ? model.savedBarSettings({ layout: { right: [entry] } }, widget.moduleName, null) : null });
   const source = fs.readFileSync(path.join(__dirname, "../OmaStatsWidget.qml"), "utf8");
-  for (const name of ["persist", "restoreSavedSettings"]) {
+  for (const name of ["persist", "restoreSavedSettings", "adoptStableSettings"]) {
     const code = source.match(new RegExp(`^  function ${name}\\([\\s\\S]*?^  }`, "m"));
     assert.ok(code, `widget function ${name} is missing`);
     vm.runInContext(code[0], widget);
@@ -221,6 +261,17 @@ test("shells without a saved bar config still persist inline settings", () => {
   widget.restoreSavedSettings();
   assert.equal(savedEntry().barDisks, "nvme1n1:used");
   assert.equal(widget.settings.graphWidth, 48);
+});
+
+test("the widget saves a legacy disk choice under the drive's id", () => {
+  const kioxia = "nvme-KIOXIA-EXCERIA_G3_SSD_YFWKS0TJZ3TS";
+  const initial = { id: "crmne.omastats", barDisks: "nvme0n1:used", disksSource: "all", graphWidth: 36 };
+  const { widget, savedEntry } = persistenceHost(initial, initial);
+  widget.service = { snapshot: { disks: { perDisk: { nvme0n1: { id: kioxia } } } } };
+  widget.adoptStableSettings();
+  assert.equal(savedEntry().barDisks, `${kioxia}:used`);
+  assert.equal(savedEntry().disksSource, "all");
+  assert.equal(savedEntry().graphWidth, 36);
 });
 
 test("settings written but not yet in shell.json stay saved until the file shows them", () => {

@@ -138,7 +138,13 @@ search field (`/` from anywhere in the panel), sorted by that page's column.
 Changes are written to this widget's entry in `~/.config/omarchy/shell.json`, so
 they survive restarts and each bar instance keeps its own. The widget reads
 its saved entry back from that file, so a change you make stays put even when
-the shell re-applies older settings to the widget. The same keys can be edited there by hand or through
+the shell re-applies older settings to the widget. Disks are saved by their
+`/dev/disk/by-id` name (model and serial), GPUs by PCI address, and
+temperature sensors that share a driver (two NVMe drives, two DIMMs) by the
+device they sit on, so a choice stays with the same hardware when the kernel
+numbers `nvme0n1` and `nvme1n1` the other way round on the next boot. Disks
+saved by kernel name in earlier versions are switched to their id
+automatically. The same keys can be edited there by hand or through
 Setup → Plugins:
 
 | Key                       | Default                                   | Meaning                                                   |
@@ -149,9 +155,9 @@ Setup → Plugins:
 | `tabs`                    | `cpu,gpu,memory,disks,network,sensors,battery` | Tabs shown in the panel                              |
 | `graphWidth`              | `36`                                      | Width of each mini graph in the bar                       |
 | `barLabels`               | `text`                                    | `text` stacks the module's letters vertically (across a vertical bar), `icon` uses glyphs |
-| `barDisks`                | *(follows `disksSource`)*                 | Disk readouts as `disk:show`, e.g. `all:speed,nvme0n1:both`; `show` is `speed`, `used` or `both`, `none` hides them |
-| `disksSource`             | `all`                                     | Disks page activity: `all` or a device like `nvme0n1`     |
-| `barSensors`              | `cpu`                                     | Sensor readouts: `cpu`, `gpu`, or hwmon ids like `nct6687/fan1` |
+| `barDisks`                | *(follows `disksSource`)*                 | Disk readouts as `disk:show`, e.g. `all:speed,nvme-Samsung_SSD_970_EVO_Plus_1TB_S4EWNF0M921645X:both`; `show` is `speed`, `used` or `both`, `none` hides them |
+| `disksSource`             | `all`                                     | Disks page activity: `all` or a disk's by-id name         |
+| `barSensors`              | `cpu`                                     | Sensor readouts: `cpu`, `gpu`, or hwmon ids like `nct6687/fan1` or `nvme@0000:02:00.0/temp1` |
 | `barGpus`                 | `all`                                     | Which GPUs get a readout: `all`, `none`, or PCI addresses like `0000:01:00.0` (pick them on the Settings page) |
 | `showGpuMemory`           | `false`                                   | Show a VRAM readout, in the GPU readout's look, beside each selected GPU when available |
 | `temperatureUnit`         | `Celsius`                                 | `Celsius` or `Fahrenheit`                                 |

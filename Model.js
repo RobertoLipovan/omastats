@@ -256,7 +256,84 @@ function sensorReading(snapshot, id, unit) {
   return null
 }
 
+// A saved sensor id from before 1.5 names a chip by driver alone, so two NVMe
+// drives or two DIMMs shared one id. Now a shared driver name carries its
+// device ("nvme@0000:02:00.0/temp1"); map an old id to its first such sensor.
+function stableSensorId(snapshot, id) {
+  var sensors = (snapshot || {}).sensors || {}
+  var all = (Array.isArray(sensors.temps) ? sensors.temps : []).concat(Array.isArray(sensors.fans) ? sensors.fans : [])
+  var legacy = null
+  for (var i = 0; i < all.length; i++) {
+    var current = String(all[i].id)
+    if (current === id) return id
+    if (legacy === null && current.replace(/@[^\/]*\//, "/") === id) legacy = current
+  }
+  return legacy === null ? id : legacy
+}
+
 // ------------------------------------------------------------------ disks
+
+// The sampler reports disks by kernel name, which follows probe order:
+// nvme0n1 can be a different drive after a reboot. Each disk also carries
+// an id from /dev/disk/by-id (model and serial), and settings save that.
+function diskId(snapshot, name) {
+  var perDisk = (((snapshot || {}).disks || {}).perDisk) || {}
+  var entry = perDisk[name]
+  return entry && entry.id ? String(entry.id) : String(name || "")
+}
+
+// The kernel name behind a saved disk: "all", the disk with that id, a disk
+// saved by kernel name before ids existed, or "" when it is not attached.
+function resolveDisk(snapshot, value) {
+  var saved = String(value || "")
+  if (!saved || saved === "all") return "all"
+  var perDisk = (((snapshot || {}).disks || {}).perDisk) || {}
+  for (var name in perDisk) if (perDisk[name] && String(perDisk[name].id) === saved) return name
+  return perDisk[saved] ? saved : ""
+}
+
+// The id to save for a disk setting. A disk that is not attached keeps its
+// saved value, so unplugging a drive never loses its readout.
+function stableDiskId(snapshot, value) {
+  var name = resolveDisk(snapshot, value)
+  return name === "" ? String(value || "") : (name === "all" ? "all" : diskId(snapshot, name))
+}
+
+// Saved disk and sensor choices rewritten to the identities the sampler
+// reports, as {key: value} for each setting that changes, or null.
+function stableSettings(settings, snapshot) {
+  var out = {}
+  var any = false
+  var raw = String(settingValue(settings, "barDisks") || "").trim()
+  if (raw && raw.toLowerCase() !== "none") {
+    var list = barDisks(settings)
+    var next = list.map(function(entry) { return { disk: stableDiskId(snapshot, entry.disk), show: entry.show } })
+    var text = barDisksText(next)
+    if (text !== barDisksText(list)) { out.barDisks = text; any = true }
+  }
+  var source = settingValue(settings, "disksSource")
+  if (source !== undefined && source !== null && String(source).trim()) {
+    var stableSource = stableDiskId(snapshot, String(source).trim())
+    if (stableSource !== String(source).trim()) { out.disksSource = stableSource; any = true }
+  }
+  var sensorsRaw = settingValue(settings, "barSensors")
+  if (sensorsRaw !== undefined && sensorsRaw !== null) {
+    var ids = parseList(sensorsRaw)
+    var stableIds = ids.map(function(id) { return stableSensorId(snapshot, id) })
+    if (stableIds.join(",") !== ids.join(",")) { out.barSensors = stableIds.join(","); any = true }
+  }
+  return any ? out : null
+}
+
+// Settings as they read once stableSettings is applied.
+function withStableSettings(settings, snapshot) {
+  var changes = stableSettings(settings, snapshot)
+  if (!changes) return settings
+  var out = {}
+  for (var k in settings) out[k] = settings[k]
+  for (var c in changes) out[c] = changes[c]
+  return out
+}
 
 function diskOptions(snapshot) {
   var s = snapshot || {}
@@ -269,7 +346,7 @@ function diskOptions(snapshot) {
   var names = Object.keys(perDisk).sort()
   for (var j = 0; j < names.length; j++) {
     var model = models[names[j]] ? " · " + String(models[names[j]]).slice(0, 22) : ""
-    out.push({ value: names[j], label: names[j] + model })
+    out.push({ value: diskId(snapshot, names[j]), label: names[j] + model })
   }
   return out
 }
@@ -290,7 +367,9 @@ function normalizeDiskShow(value) {
 }
 
 // The bar's disk readouts as [{disk, show}]. "barDisks" lists entries like
-// "all:speed,nvme0n1:both"; "none" means no readout. Unset, it reproduces the
+// "all:speed,nvme-KIOXIA_EXCERIA_G3_SSD_YFWKS0TJZ3TS:both"; "none" means no
+// readout. Disk ids can contain colons (usb-..._0:0), so the show is the
+// text after the last one, when it names a show. Unset, it reproduces the
 // 1.1 readout: one for disksSource, showing capacity when the disk look was
 // a ring and transfer speed otherwise.
 function barDisks(settings) {
@@ -307,12 +386,13 @@ function barDisks(settings) {
   var seen = []
   var parts = parseList(raw)
   for (var i = 0; i < parts.length; i++) {
-    var at = parts[i].indexOf(":")
-    var disk = at === -1 ? parts[i] : parts[i].slice(0, at)
+    var at = parts[i].lastIndexOf(":")
+    var show = at === -1 ? "" : normalizeDiskShow(parts[i].slice(at + 1))
+    var disk = show ? parts[i].slice(0, at) : parts[i]
     if (disk.toLowerCase() === "all") disk = "all"
     if (!disk || seen.indexOf(disk) !== -1) continue
     seen.push(disk)
-    out.push({ disk: disk, show: normalizeDiskShow(at === -1 ? "" : parts[i].slice(at + 1)) || "speed" })
+    out.push({ disk: disk, show: show || "speed" })
   }
   return out
 }

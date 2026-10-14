@@ -56,8 +56,10 @@ Column {
   readonly property var snapshot: service ? service.snapshot : ({})
   readonly property var diskOptions: Model.diskOptions(snapshot)
   readonly property var sensorOptions: Model.sensorOptions(snapshot)
-  readonly property var barDiskList: Model.barDisks(settings)
-  readonly property var barSensorIds: Model.parseList(Model.settingValue(settings, "barSensors"))
+  // Choices saved before devices had ids read as the ids they now map to.
+  readonly property var stableSettings: Model.withStableSettings(settings, snapshot)
+  readonly property var barDiskList: Model.barDisks(stableSettings)
+  readonly property var barSensorIds: Model.parseList(Model.settingValue(stableSettings, "barSensors"))
   readonly property var gpuOptions: Model.gpuList(snapshot)
   // "all" keeps a GPU added later visible without another visit here.
   readonly property var selectedGpuIds: {
@@ -425,7 +427,7 @@ Column {
           width: parent.width - x
           label: "Activity"
           options: root.diskOptions
-          value: String(Model.settingValue(root.settings, "disksSource") || "all")
+          value: String(Model.settingValue(root.stableSettings, "disksSource") || "all")
           foreground: root.foreground
           fontFamily: root.fontFamily
           onChanged: function(value) {

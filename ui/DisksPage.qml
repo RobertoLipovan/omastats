@@ -26,7 +26,7 @@ Column {
   readonly property var disks: snap.disks || ({})
   readonly property var volumes: Array.isArray(disks.volumes) ? disks.volumes : []
   readonly property var procs: snap.procs || null
-  readonly property string source: String(Model.settingValue(settings, "disksSource") || "all")
+  readonly property string source: Model.resolveDisk(snap, Model.settingValue(settings, "disksSource"))
   readonly property bool singleDisk: source !== "all" && !!(disks.perDisk && disks.perDisk[source])
   readonly property real readRate: singleDisk ? Model.num(disks.perDisk[source].read) : Model.num(disks.read)
   readonly property real writeRate: singleDisk ? Model.num(disks.perDisk[source].write) : Model.num(disks.write)
